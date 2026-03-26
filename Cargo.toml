@@ -1,0 +1,13 @@
+[package]
+name = "renderer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = { path = "wgpu/wgpu" }
+winit = "0.30"
+anyhow = "1.0"
+pollster = "0.4"
+log = "0.4"
+glam = "0.32"
+flate2 = "1.1"
