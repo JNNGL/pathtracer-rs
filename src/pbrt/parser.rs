@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::pbrt::Tokenizer;
 
@@ -438,33 +439,33 @@ pub struct AreaLightSource {
 
 #[derive(Debug)]
 pub enum Directive {
-    Identity,
-    Translate(glam::Vec3),
-    Scale(glam::Vec3),
-    Rotate { angle: f32, axis: glam::Vec3 },
+    Identity, // IMPLEMENTED
+    Translate(glam::Vec3), // IMPLEMENTED
+    Scale(glam::Vec3), // IMPLEMENTED
+    Rotate { angle: f32, axis: glam::Vec3 }, // IMPLEMENTED
     LookAt { eye: glam::Vec3, look: glam::Vec3, up: glam::Vec3 },
-    CoordinateSystem { name: String },
-    CoordSysTransform { name: String },
-    Transform(glam::Mat4),
-    ConcatTransform(glam::Mat4),
+    CoordinateSystem { name: String }, // IMPLEMENTED
+    CoordSysTransform { name: String }, // IMPLEMENTED
+    Transform(glam::Mat4), // IMPLEMENTED
+    ConcatTransform(glam::Mat4), // IMPLEMENTED
     TransformTimes { start: f32, end: f32 },
     ActiveTransform(ActiveTransform),
-    Include(String),
-    Import(String),
+    Include(String), // IMPLEMENTED
+    Import(String), // IMPLEMENTED
     Option(NamedParameter),
     Camera { camera: CameraType, shutter_open: f32, shutter_close: f32 },
     Sampler { sampler: SamplerType, seed: i32 },
-    ColorSpace(ColorSpace),
+    ColorSpace(ColorSpace), // IMPLEMENTED
     Film { x_resolution: i32, y_resolution: i32,
         crop_window: [glam::Vec2; 2], pixel_bounds: [glam::IVec2; 2],
         diagonal: f32, filename: String, iso: f32, white_balance: f32,
         sensor: String },
     PixelFilter { filter: PixelFilter },
     WorldBegin,
-    AttributeBegin,
-    AttributeEnd,
+    AttributeBegin, // IMPLEMENTED
+    AttributeEnd, // IMPLEMENTED
     ReverseOrientation,
-    Attribute { target: AttributeTarget, parameters: ParameterDictionary },
+    Attribute { target: AttributeTarget, parameters: ParameterDictionary }, // IMPLEMENTED
     Shape { shape: Shape, alpha: TextureRef },
     ObjectBegin { name: String },
     ObjectEnd,
@@ -822,7 +823,7 @@ fn expect_mat4(tokenizer: &mut Tokenizer) -> Result<glam::Mat4, &'static str> {
 }
 
 fn parse_bump_normal_map(
-    state: &ParseState,
+    state: &GraphicsState,
     parameters: &ParameterDictionary,
 ) -> Result<BumpNormalMap, &'static str> {
     Ok(BumpNormalMap {
@@ -846,7 +847,7 @@ macro_rules! parse_roughness {
 }
 
 fn parse_coating(
-    state: &ParseState,
+    state: &GraphicsState,
     parameters: &ParameterDictionary,
 ) -> Result<Coating, &'static str> {
     Ok(Coating {
@@ -858,7 +859,7 @@ fn parse_coating(
     })
 }
 
-fn parse_material(state: &ParseState, tokenizer: &mut Tokenizer) -> Result<Material, &'static str> {
+fn parse_material(state: &GraphicsState, tokenizer: &mut Tokenizer) -> Result<Material, &'static str> {
     let material = expect_string(tokenizer)?;
     let parameters = parse_parameter_list(tokenizer)?;
 
@@ -980,7 +981,7 @@ fn color_space_illuminant(color_space: &ColorSpace) -> Spectrum {
     }
 }
 
-pub fn parse_directive(state: &ParseState, tokenizer: &mut Tokenizer)
+pub fn parse_directive(state: &GraphicsState, tokenizer: &mut Tokenizer)
     -> Result<Option<Directive>, String> {
     let t = match tokenizer.next_token()? {
         Some(t) => t,
@@ -1509,14 +1510,144 @@ pub struct Transformation {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct GraphicsState {
+    pub shape_attributes: ParameterDictionary,
+    pub light_attributes: ParameterDictionary,
+    pub material_attributes: ParameterDictionary,
+    pub medium_attributes: ParameterDictionary,
+    pub texture_attributes: ParameterDictionary,
+    pub current_material: Material,
+    pub color_space: ColorSpace,
+    pub transformation: Transformation,
+    pub area_light: Option<AreaLightSource>,
+    pub coordinate_systems: HashMap<String, Transformation>
+}
+
+#[derive(Debug, Clone)]
 pub struct ParseState {
-    shape_attributes: ParameterDictionary,
-    light_attributes: ParameterDictionary,
-    material_attributes: ParameterDictionary,
-    medium_attributes: ParameterDictionary,
-    texture_attributes: ParameterDictionary,
-    current_material: Material,
-    color_space: ColorSpace,
-    transformation: Transformation,
-    area_light: Option<AreaLightSource>,
+    pub graphics_state: Vec<GraphicsState>,
+    pub working_directory: PathBuf,
+}
+
+impl Default for ParseState {
+    fn default() -> Self {
+        Self {
+            graphics_state: vec![GraphicsState::default()],
+            working_directory: std::env::current_dir().unwrap(),
+        }
+    }
+}
+
+impl ParseState {
+    pub fn apply_directive(self: &mut Self, directive: Directive) -> Result<(), String> {
+        let state = self.graphics_state.last_mut().unwrap();
+
+        match directive {
+            // Include / Import
+            Directive::Include(file) => {
+                let path = self.working_directory.join(&file);
+                let mut tokenizer = Tokenizer::create_from_file(path.as_path())
+                    .map_err(|_| format!("failed to open file: {}", file))?;
+
+                let mut working_directory = path.parent().unwrap().to_path_buf();
+                std::mem::swap(&mut self.working_directory, &mut working_directory);
+
+                self.parse(&mut tokenizer)?;
+
+                self.working_directory = working_directory;
+            },
+            Directive::Import(file) => {
+                let path = self.working_directory.join(&file);
+                let mut tokenizer = Tokenizer::create_from_file(path.as_path())
+                    .map_err(|_| format!("failed to open file: {}", file))?;
+
+                let mut state = self.clone();
+                state.working_directory = path.parent().unwrap().to_path_buf();
+
+                state.parse(&mut tokenizer)?;
+            },
+
+            // Attributes
+            Directive::AttributeBegin => {
+                self.graphics_state.push(self.graphics_state.last().unwrap().clone());
+            },
+            Directive::AttributeEnd => {
+                if self.graphics_state.len() > 1 {
+                    self.graphics_state.pop();
+                } else {
+                    return Err("no graphics state to restore".to_string());
+                }
+            },
+            Directive::Attribute {
+                target,
+                parameters,
+            } => {
+                match target {
+                    AttributeTarget::Shape => &mut state.shape_attributes,
+                    AttributeTarget::Light => &mut state.light_attributes,
+                    AttributeTarget::Material => &mut state.material_attributes,
+                    AttributeTarget::Medium => &mut state.medium_attributes,
+                    AttributeTarget::Texture => &mut state.texture_attributes,
+                }.parameters.extend(parameters.parameters);
+            },
+
+            Directive::ColorSpace(color_space) => {
+                state.color_space = color_space;
+            },
+
+            Directive::Identity => {
+                state.transformation.matrix = glam::Mat4::IDENTITY;
+            },
+            Directive::Transform(transform) => {
+                state.transformation.matrix = transform;
+            },
+            Directive::ConcatTransform(transform) => {
+                state.transformation.matrix *= transform;
+            },
+            Directive::Translate(translation) => {
+                state.transformation.matrix *= glam::Mat4::from_translation(translation);
+            },
+            Directive::Rotate {
+                angle,
+                axis
+            } => {
+                let matrix = glam::Mat4::from_quat(glam::Quat::from_axis_angle(axis, angle));
+                state.transformation.matrix *= matrix;
+            },
+            Directive::Scale(scale) => {
+                state.transformation.matrix *= glam::Mat4::from_scale(scale);
+            },
+
+            // Coordinate Systems
+            Directive::CoordinateSystem {
+                name
+            } => {
+                state.coordinate_systems.insert(name, state.transformation.clone());
+            },
+            Directive::CoordSysTransform {
+                name
+            } => {
+                state.transformation = state.coordinate_systems.get(&name)
+                    .ok_or_else(|| format!("Coordinate system not found: {}", name))?.clone();
+            },
+
+
+
+            _ => {},
+        }
+
+        Ok(())
+    }
+
+    pub fn parse(self: &mut Self, tokenizer: &mut Tokenizer) -> Result<(), String> {
+        loop {
+            let directive = parse_directive(self.graphics_state.last().unwrap(), tokenizer)?;
+            match directive {
+                Some(directive) => self.apply_directive(directive)?,
+                None => break,
+            }
+        }
+
+        Ok(())
+    }
 }

@@ -1,4 +1,6 @@
 pub mod pbrt;
+mod scene;
+mod camera;
 
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -192,17 +194,13 @@ impl ApplicationHandler<State> for Application {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut tokenizer = pbrt::Tokenizer::create_from_file("test.pbrt".to_string())?;
-    let state = pbrt::parser::ParseState::default();
+    let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new("test.pbrt"))?;
+    let mut state = pbrt::parser::ParseState {
+        working_directory: tokenizer.directory.clone(),
+        ..Default::default()
+    };
 
-    loop {
-        let directive = pbrt::parser::parse_directive(&state, &mut tokenizer).unwrap();
-        if directive.is_none() {
-            break;
-        }
-
-        println!("=> {:?}", directive.unwrap());
-    }
+    state.parse(&mut tokenizer).unwrap();
 
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = Application::new();

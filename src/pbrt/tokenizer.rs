@@ -1,6 +1,7 @@
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct FileLoc {
     pub line: i32,
     pub column: i32,
@@ -15,6 +16,7 @@ impl Default for FileLoc {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct RawToken {
     pub token: String,
     pub loc: FileLoc,
@@ -22,6 +24,7 @@ pub struct RawToken {
 
 pub struct Tokenizer {
     pub contents: String,
+    pub directory: PathBuf,
     pub loc: FileLoc,
     pub index: usize,
     token_stack: Vec<RawToken>,
@@ -42,16 +45,21 @@ fn decode_escaped_char(c: char) -> Result<char, &'static str> {
 }
 
 impl Tokenizer {
-    pub fn new(contents: String) -> Self {
+    pub fn new(directory: PathBuf, contents: String) -> Self {
         Self {
             contents,
+            directory,
             loc: FileLoc::default(),
             index: 0,
             token_stack: Vec::new(),
         }
     }
 
-    pub fn create_from_file(filename: String) -> Result<Self, std::io::Error> {
+    pub fn create_from_text(contents: String) -> Self {
+        Self::new(PathBuf::new(), contents)
+    }
+
+    pub fn create_from_file(filename: &Path) -> Result<Self, std::io::Error> {
         let mut contents: String;
         if filename.ends_with(".gz") {
             contents = String::new();
@@ -63,7 +71,11 @@ impl Tokenizer {
             contents = std::fs::read_to_string(&filename)?;
         }
 
-        Ok(Self::new(contents))
+        let path = Path::new(filename).to_path_buf();
+        let directory = path.parent().map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+
+        Ok(Self::new(directory, contents))
     }
 
     pub fn get_char(&mut self) -> Option<char> {
