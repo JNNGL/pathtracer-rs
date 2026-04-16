@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::pbrt::Tokenizer;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::Display)]
 pub enum ParameterValue {
     Integer(Vec<i32>),
     Float(Vec<f32>),
@@ -483,9 +483,9 @@ fn is_quoted_string(str: &String) -> bool {
     str.starts_with("\"") && str.ends_with("\"")
 }
 
-fn unquote_string(str: &String) -> Result<String, &'static str> {
+fn unquote_string(str: &String) -> Result<String, String> {
     if !is_quoted_string(str) {
-        return Err("expected quoted string");
+        return Err(format!("expected quoted string, got `{}`", str));
     }
 
     let str = str.strip_prefix("\"").unwrap();
@@ -493,45 +493,45 @@ fn unquote_string(str: &String) -> Result<String, &'static str> {
 }
 
 trait ParseValue<T> {
-    fn parse(token: &String) -> Result<T, &'static str>;
+    fn parse(token: &String) -> Result<T, String>;
 }
 
 impl ParseValue<i32> for i32 {
-    fn parse(token: &String) -> Result<i32, &'static str> {
+    fn parse(token: &String) -> Result<i32, String> {
         match token.parse::<i32>() {
             Ok(v) => Ok(v),
-            Err(_) => Err("failed to parse int"),
+            Err(_) => Err(format!("failed to parse int `{}`", token)),
         }
     }
 }
 
 impl ParseValue<f32> for f32 {
-    fn parse(token: &String) -> Result<f32, &'static str> {
+    fn parse(token: &String) -> Result<f32, String> {
         match token.parse::<f32>() {
             Ok(v) => Ok(v),
-            Err(_) => Err("failed to parse float"),
+            Err(_) => Err(format!("failed to parse float `{}`", token)),
         }
     }
 }
 
 impl ParseValue<bool> for bool {
-    fn parse(token: &String) -> Result<bool, &'static str> {
+    fn parse(token: &String) -> Result<bool, String> {
         match token.as_str() {
             "true" => Ok(true),
             "false" => Ok(false),
-            _ => Err("failed to parse bool"),
+            _ => Err(format!("failed to parse bool `{}`", token)),
         }
     }
 }
 
 impl ParseValue<String> for String {
-    fn parse(token: &String) -> Result<String, &'static str> {
+    fn parse(token: &String) -> Result<String, String> {
         Ok(unquote_string(token)?)
     }
 }
 
 fn parse_vector<T: ParseValue<T>>(tokenizer: &mut Tokenizer)
-    -> Result<Vec<T>, &'static str> {
+    -> Result<Vec<T>, String> {
     let t = tokenizer.expect_token()?;
 
     if t.token == "[" {
@@ -553,7 +553,7 @@ fn parse_vector<T: ParseValue<T>>(tokenizer: &mut Tokenizer)
 }
 
 fn parse_named_parameter(tokenizer: &mut Tokenizer)
-    -> Result<Option<NamedParameter>, &'static str> {
+    -> Result<Option<NamedParameter>, String> {
     let token = match tokenizer.next_token()? {
         Some(token) => token,
         None => return Ok(None),
@@ -632,7 +632,20 @@ fn parse_named_parameter(tokenizer: &mut Tokenizer)
             let t = tokenizer.expect_token()?;
 
             if t.token == "[" {
+                let element = tokenizer.expect_token()?;
+                let is_named = element.token.starts_with("\"");
+
+                tokenizer.push_token(element);
                 tokenizer.push_token(t);
+
+                if is_named {
+                    return Ok(Some(NamedParameter {
+                        name: String::from(name),
+                        value: ParameterValue::Spectrum(Spectrum::Named(
+                            parse_vector::<String>(tokenizer)?.first().unwrap().to_string()
+                        ))
+                    }))
+                }
 
                 Ok(Some(NamedParameter {
                     name: String::from(name),
@@ -668,7 +681,7 @@ fn parse_named_parameter(tokenizer: &mut Tokenizer)
             name: String::from(name),
             value: ParameterValue::Texture(expect_string(tokenizer)?),
         })),
-        _ => Err("invalid parameter type"),
+        _ => Err(format!("invalid parameter type: {}", param_type)),
     }
 }
 
@@ -681,7 +694,7 @@ macro_rules! typed_getters {
     ($many:ident, $one:ident, $variant:ident, $ty:ty) => {
         #[allow(unused)]
         fn $many<'a>(&'a self, name: &str, fallback: Option<&'a Self>)
-            -> Result<Option<&'a Vec<$ty>>, &'static str> {
+            -> Result<Option<&'a Vec<$ty>>, String> {
             self.get_vec(name, fallback, |v| match v {
                 ParameterValue::$variant(x) => Some(x),
                 _ => None,
@@ -690,7 +703,7 @@ macro_rules! typed_getters {
 
         #[allow(unused)]
         fn $one<'a>(&'a self, name: &str, fallback: Option<&'a Self>)
-            -> Result<Option<$ty>, &'static str> {
+            -> Result<Option<$ty>, String> {
             self.get_first(name, fallback, |v| match v {
                 ParameterValue::$variant(x) => Some(x),
                 _ => None,
@@ -710,9 +723,9 @@ impl ParameterDictionary {
     fn get_vec<'a, T>(
         &'a self, name: &str, fallback: Option<&'a Self>,
         cast: impl FnOnce(&'a ParameterValue) -> Option<&'a Vec<T>>,
-    ) -> Result<Option<&'a Vec<T>>, &'static str> {
+    ) -> Result<Option<&'a Vec<T>>, String> {
         match self.get(name, fallback).map(|p| &p.value) {
-            Some(v) => cast(v).map(Some).ok_or("wrong parameter type"),
+            Some(v) => cast(v).map(Some).ok_or(format!("wrong parameter type: {}", v)),
             None => Ok(None),
         }
     }
@@ -720,9 +733,9 @@ impl ParameterDictionary {
     fn get_first<'a, T>(
         &'a self, name: &str, fallback: Option<&'a Self>,
         cast: impl FnOnce(&'a ParameterValue) -> Option<&'a Vec<T>>,
-    ) -> Result<Option<&'a T>, &'static str> {
+    ) -> Result<Option<&'a T>, String> {
         match self.get_vec(name, fallback, cast)? {
-            Some(v) => v.first().map(Some).ok_or("expected at least one element"),
+            Some(v) => v.first().map(Some).ok_or("expected at least one element".to_string()),
             None => Ok(None),
         }
     }
@@ -738,7 +751,7 @@ impl ParameterDictionary {
     typed_getters!(get_rgbs, get_rgb, RGB, glam::Vec3);
 
     fn get_strings<'a>(&'a self, name: &str, fallback: Option<&'a Self>)
-        -> Result<Option<&'a Vec<String>>, &'static str> {
+        -> Result<Option<&'a Vec<String>>, String> {
         self.get_vec(name, fallback, |v| match v {
             ParameterValue::String(x) => Some(x),
             _ => None,
@@ -746,7 +759,7 @@ impl ParameterDictionary {
     }
 
     fn get_string<'a>(&'a self, name: &str, fallback: Option<&'a Self>)
-        -> Result<Option<&'a String>, &'static str> {
+        -> Result<Option<&'a String>, String> {
         self.get_first(name, fallback, |v| match v {
             ParameterValue::String(x) => Some(x),
             _ => None,
@@ -754,7 +767,7 @@ impl ParameterDictionary {
     }
 
     fn get_texture_ref<'a>(&'a self, name: &str, fallback: Option<&'a Self>)
-        -> Result<Option<TextureRef>, &'static str> {
+        -> Result<Option<TextureRef>, String> {
         let parameter = match self.get(name, fallback) {
             Some(v) => v,
             None => return Ok(None),
@@ -769,12 +782,12 @@ impl ParameterDictionary {
                 *value.first().ok_or("expected at least one element")?))),
             ParameterValue::Spectrum(value) => Ok(Some(
                 TextureRef::Spectrum(value.clone()))),
-            _ => Err("invalid parameter type"),
+            _ => Err(format!("invalid parameter type: {}", parameter.value)),
         }
     }
 
     fn get_spectrum<'a>(&'a self, name: &str, fallback: Option<&'a Self>)
-        -> Result<Option<Spectrum>, &'static str> {
+        -> Result<Option<Spectrum>, String> {
         let parameter = match self.get(name, fallback) {
             Some(v) => v,
             None => return Ok(None),
@@ -786,12 +799,12 @@ impl ParameterDictionary {
             ParameterValue::RGB(value) => Ok(Some(Spectrum::RGB(
                 *value.first().ok_or("expected at least one element")?))),
             ParameterValue::Spectrum(value) => Ok(Some(value.clone())),
-            _ => Err("invalid parameter type"),
+            _ => Err(format!("invalid parameter type: {}", parameter.value)),
         }
     }
 }
 
-fn parse_parameter_list(tokenizer: &mut Tokenizer) -> Result<ParameterDictionary, &'static str> {
+fn parse_parameter_list(tokenizer: &mut Tokenizer) -> Result<ParameterDictionary, String> {
     let mut parameters = HashMap::<String, NamedParameter>::new();
 
     loop {
@@ -802,11 +815,11 @@ fn parse_parameter_list(tokenizer: &mut Tokenizer) -> Result<ParameterDictionary
     }
 }
 
-fn expect_float(tokenizer: &mut Tokenizer) -> Result<f32, &'static str> {
+fn expect_float(tokenizer: &mut Tokenizer) -> Result<f32, String> {
     Ok(f32::parse(&tokenizer.expect_token()?.token)?)
 }
 
-fn expect_vec3(tokenizer: &mut Tokenizer) -> Result<glam::Vec3, &'static str> {
+fn expect_vec3(tokenizer: &mut Tokenizer) -> Result<glam::Vec3, String> {
     Ok(glam::vec3(
         expect_float(tokenizer)?,
         expect_float(tokenizer)?,
@@ -814,18 +827,18 @@ fn expect_vec3(tokenizer: &mut Tokenizer) -> Result<glam::Vec3, &'static str> {
     ))
 }
 
-fn expect_string(tokenizer: &mut Tokenizer) -> Result<String, &'static str> {
+fn expect_string(tokenizer: &mut Tokenizer) -> Result<String, String> {
     Ok(unquote_string(&tokenizer.expect_token()?.token)?)
 }
 
-fn expect_mat4(tokenizer: &mut Tokenizer) -> Result<glam::Mat4, &'static str> {
+fn expect_mat4(tokenizer: &mut Tokenizer) -> Result<glam::Mat4, String> {
     Ok(glam::Mat4::from_cols_slice(parse_vector::<f32>(tokenizer)?.as_slice()))
 }
 
 fn parse_bump_normal_map(
     state: &GraphicsState,
     parameters: &ParameterDictionary,
-) -> Result<BumpNormalMap, &'static str> {
+) -> Result<BumpNormalMap, String> {
     Ok(BumpNormalMap {
         displacement: parameters.get_texture_ref("displacement", Some(&state.material_attributes))?,
         normal_map: parameters.get_string("normalmap", Some(&state.material_attributes))?.map(|s| s.clone()),
@@ -837,7 +850,7 @@ macro_rules! parse_roughness {
         {
             let roughness = $parameters.get_float(concat!($prefix, "roughness"), Some(&$state.material_attributes))?.unwrap_or(0.0);
 
-            Ok(Roughness {
+            Ok::<Roughness, String>(Roughness {
                 u: $parameters.get_float(concat!($prefix, "uroughness"), Some(&$state.material_attributes))?.unwrap_or(roughness),
                 v: $parameters.get_float(concat!($prefix, "vroughness"), Some(&$state.material_attributes))?.unwrap_or(roughness),
                 remap: $parameters.get_bool(concat!($prefix, "remaproughness"), Some(&$state.material_attributes))?.unwrap_or(true),
@@ -849,7 +862,7 @@ macro_rules! parse_roughness {
 fn parse_coating(
     state: &GraphicsState,
     parameters: &ParameterDictionary,
-) -> Result<Coating, &'static str> {
+) -> Result<Coating, String> {
     Ok(Coating {
         albedo: parameters.get_texture_ref("albedo", Some(&state.material_attributes))?.unwrap_or(TextureRef::Float(0.0)),
         asymmetry: parameters.get_texture_ref("g", Some(&state.material_attributes))?.unwrap_or(TextureRef::Float(0.0)),
@@ -859,9 +872,18 @@ fn parse_coating(
     })
 }
 
-fn parse_material(state: &GraphicsState, tokenizer: &mut Tokenizer) -> Result<Material, &'static str> {
-    let material = expect_string(tokenizer)?;
-    let parameters = parse_parameter_list(tokenizer)?;
+fn parse_material(state: &GraphicsState, tokenizer: &mut Tokenizer, inline: bool) -> Result<Material, String> {
+    let material;
+    let parameters;
+
+    if inline {
+        material = expect_string(tokenizer)?;
+        parameters = parse_parameter_list(tokenizer)?;
+    } else {
+        parameters = parse_parameter_list(tokenizer)?;
+        material = parameters.get_string("type", Some(&state.material_attributes))?
+            .ok_or("missing type")?.clone();
+    }
 
     match material.as_str() {
         "coateddiffuse" => Ok(Material::CoatedDiffuse {
@@ -957,7 +979,7 @@ fn parse_material(state: &GraphicsState, tokenizer: &mut Tokenizer) -> Result<Ma
             scale: parameters.get_float("scale", Some(&state.material_attributes))?
                 .unwrap_or(1.0),
         }),
-        _ => Err("invalid material")
+        _ => Err(format!("invalid material: `{}`", material))
     }
 }
 
@@ -1363,10 +1385,10 @@ pub fn parse_directive(state: &GraphicsState, tokenizer: &mut Tokenizer)
                 two_sided: parameters.get_bool("twosided", Some(&state.light_attributes))?.unwrap_or(false),
             })))
         },
-        "Material" => Ok(Some(Directive::Material(parse_material(state, tokenizer)?))),
+        "Material" => Ok(Some(Directive::Material(parse_material(state, tokenizer, true)?))),
         "MakeNamedMaterial" => Ok(Some(Directive::MakeNamedMaterial {
             name: expect_string(tokenizer)?,
-            material: parse_material(state, tokenizer)?,
+            material: parse_material(state, tokenizer, false)?,
         })),
         "NamedMaterial" => Ok(Some(Directive::NamedMaterial {
             name: expect_string(tokenizer)?,
@@ -1401,7 +1423,7 @@ pub fn parse_directive(state: &GraphicsState, tokenizer: &mut Tokenizer)
                         v1: parameters.get_vector3("v1", Some(&state.texture_attributes))?.unwrap_or(glam::vec3(1.0, 0.0, 0.0)),
                         v2: parameters.get_vector3("v1", Some(&state.texture_attributes))?.unwrap_or(glam::vec3(0.0, 1.0, 0.0)),
                     }),
-                    _ => Err("invalid texture mapping"),
+                    _ => Err(format!("invalid texture mapping: `{}`", s)),
                 }).unwrap_or(Ok(TextureMapping::Uv { scale, delta }))?;
 
             Ok(Some(Directive::Texture {
@@ -1549,12 +1571,7 @@ impl ParseState {
                 let mut tokenizer = Tokenizer::create_from_file(path.as_path())
                     .map_err(|_| format!("failed to open file: {}", file))?;
 
-                let mut working_directory = path.parent().unwrap().to_path_buf();
-                std::mem::swap(&mut self.working_directory, &mut working_directory);
-
                 self.parse(&mut tokenizer)?;
-
-                self.working_directory = working_directory;
             },
             Directive::Import(file) => {
                 let path = self.working_directory.join(&file);
@@ -1562,7 +1579,6 @@ impl ParseState {
                     .map_err(|_| format!("failed to open file: {}", file))?;
 
                 let mut state = self.clone();
-                state.working_directory = path.parent().unwrap().to_path_buf();
 
                 state.parse(&mut tokenizer)?;
             },
@@ -1641,7 +1657,14 @@ impl ParseState {
 
     pub fn parse(self: &mut Self, tokenizer: &mut Tokenizer) -> Result<(), String> {
         loop {
-            let directive = parse_directive(self.graphics_state.last().unwrap(), tokenizer)?;
+            let directive = match parse_directive(self.graphics_state.last().unwrap(), tokenizer) {
+                Ok(directive) => directive,
+                Err(message) => return Err(
+                    format!("Error parsing {} at line {}: {}",
+                            tokenizer.file.to_str().unwrap_or("<?>"),
+                            tokenizer.loc.line, message)),
+            };
+
             match directive {
                 Some(directive) => self.apply_directive(directive)?,
                 None => break,

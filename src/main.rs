@@ -194,7 +194,7 @@ impl ApplicationHandler<State> for Application {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new("test.pbrt"))?;
+    let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new("/Users/jnngl/Desktop/pbrt-v4-scenes/bmw-m6/bmw-m6.pbrt"))?;
     let mut state = pbrt::parser::ParseState {
         working_directory: tokenizer.directory.clone(),
         ..Default::default()
