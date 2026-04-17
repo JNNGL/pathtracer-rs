@@ -1,6 +1,6 @@
+pub mod camera;
 pub mod pbrt;
-mod scene;
-mod camera;
+pub mod scene;
 
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -16,10 +16,12 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     surface_configured: bool,
+
+    scene: scene::Scene,
 }
 
 impl State {
-    async fn new(window: Arc<Window>) -> anyhow::Result<State> {
+    async fn new(window: Arc<Window>, scene: scene::Scene) -> anyhow::Result<State> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -32,23 +34,28 @@ impl State {
 
         let surface = instance.create_surface(window.clone())?;
 
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }).await?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await?;
 
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            required_features: wgpu::Features::empty(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: Default::default(),
-            trace: wgpu::Trace::Off,
-        }).await?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps.formats
+        let surface_format = surface_caps
+            .formats
             .iter()
             .find(|f| f.is_srgb())
             .copied()
@@ -65,6 +72,48 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
+        let shader_module = device.create_shader_module(wgpu::include_wgsl!("render.wgsl"));
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: None,
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Ok(Self {
             window,
             surface,
@@ -72,6 +121,7 @@ impl State {
             queue,
             config,
             surface_configured: false,
+            scene,
         })
     }
 
@@ -92,9 +142,13 @@ impl State {
         }
 
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
         {
             let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -144,9 +198,7 @@ struct Application {
 
 impl Application {
     fn new() -> Self {
-        Self {
-            state: None,
-        }
+        Self { state: None }
     }
 }
 
@@ -154,10 +206,26 @@ impl ApplicationHandler<State> for Application {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window_attributes = Window::default_attributes();
         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-        self.state = Some(pollster::block_on(State::new(window)).unwrap());
+
+        let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new(
+            "/Users/jnngl/Desktop/pbrt-v4-scenes/bmw-m6/bmw-m6.pbrt",
+        )).unwrap();
+        let mut state = pbrt::parser::ParseState {
+            working_directory: tokenizer.directory.clone(),
+            ..Default::default()
+        };
+
+        let scene = state.parse(&mut tokenizer).unwrap();
+
+        self.state = Some(pollster::block_on(State::new(window, scene)).unwrap());
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
         let state = match &mut self.state {
             Some(state) => state,
             None => return,
@@ -169,7 +237,7 @@ impl ApplicationHandler<State> for Application {
             WindowEvent::RedrawRequested => {
                 state.update();
                 match state.render() {
-                    Ok(_) => {}
+                    Ok(_) | Err(wgpu::SurfaceError::Occluded) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         let size = state.window.inner_size();
                         state.resize(size.width, size.height);
@@ -178,7 +246,7 @@ impl ApplicationHandler<State> for Application {
                         log::error!("Unable to render: {}", e);
                     }
                 }
-            },
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -194,13 +262,13 @@ impl ApplicationHandler<State> for Application {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new("/Users/jnngl/Desktop/pbrt-v4-scenes/bmw-m6/bmw-m6.pbrt"))?;
-    let mut state = pbrt::parser::ParseState {
-        working_directory: tokenizer.directory.clone(),
-        ..Default::default()
-    };
+    if std::env::var_os("RUST_LOG").is_none() {
+        unsafe {
+            std::env::set_var("RUST_LOG", "info");
+        }
+    }
 
-    state.parse(&mut tokenizer).unwrap();
+    env_logger::init();
 
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = Application::new();

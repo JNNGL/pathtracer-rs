@@ -9,10 +9,7 @@ pub struct FileLoc {
 
 impl Default for FileLoc {
     fn default() -> Self {
-        Self {
-            line: 1,
-            column: 0,
-        }
+        Self { line: 1, column: 0 }
     }
 }
 
@@ -47,7 +44,9 @@ fn decode_escaped_char(c: char) -> Result<char, &'static str> {
 
 impl Tokenizer {
     pub fn new(file: PathBuf, contents: String) -> Self {
-        let directory = file.parent().map(|p| p.to_path_buf())
+        let directory = file
+            .parent()
+            .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap());
 
         Self {
@@ -135,7 +134,7 @@ impl Tokenizer {
             };
 
             match char {
-                ' ' | '\n' | '\t' | '\r' => {},
+                ' ' | '\n' | '\t' | '\r' => {}
                 '"' => {
                     let mut string = String::from("\"");
 
@@ -149,26 +148,26 @@ impl Tokenizer {
                                 string.push('\"');
                                 return Ok(Some(RawToken {
                                     token: string,
-                                    loc: start_loc
-                                }))
-                            },
-                            _ => {},
+                                    loc: start_loc,
+                                }));
+                            }
+                            _ => {}
                         }
 
                         string.push(char);
                     }
-                },
-                '[' | ']' => return Ok(Some(RawToken {
-                    token: char.to_string(),
-                    loc: start_loc
-                })),
-                '#' => {
-                    loop {
-                        let char = self.expect_char()?;
+                }
+                '[' | ']' => {
+                    return Ok(Some(RawToken {
+                        token: char.to_string(),
+                        loc: start_loc,
+                    }));
+                }
+                '#' => loop {
+                    let char = self.expect_char()?;
 
-                        if char == '\n' || char == '\r' {
-                            return self.next_token();
-                        }
+                    if char == '\n' || char == '\r' {
+                        return self.next_token();
                     }
                 },
                 _ => {
@@ -191,8 +190,8 @@ impl Tokenizer {
 
                     return Ok(Some(RawToken {
                         token: string,
-                        loc: start_loc
-                    }))
+                        loc: start_loc,
+                    }));
                 }
             };
         }
@@ -200,11 +199,9 @@ impl Tokenizer {
 
     pub fn expect_token(&mut self) -> Result<RawToken, &'static str> {
         match self.next_token() {
-            Ok(token) => {
-                match token {
-                    Some(token) => Ok(token),
-                    None => Err("unexpected end of file"),
-                }
+            Ok(token) => match token {
+                Some(token) => Ok(token),
+                None => Err("unexpected end of file"),
             },
             Err(err) => Err(err),
         }

@@ -9,7 +9,9 @@ winit = "0.30"
 anyhow = "1.0"
 pollster = "0.4"
 log = "0.4"
+env_logger = "0.11"
 glam = { version = "0.32", features = ["bytemuck"] }
 flate2 = "1.1"
 bytemuck = "1.25"
-strum = { version = "0.28", features = [ "derive"] }
+strum = { version = "0.28", features = ["derive"] }
+ply-rs = "0.1"
