@@ -30,12 +30,18 @@ impl Camera {
 
     pub fn from_transform(transform: Mat4, aspect_ratio: f32) -> Self {
         let angles = transform.to_euler(EulerRot::ZYX);
-        Camera::new(
-            transform.col(3).xyz(),
-            angles.2,
-            angles.1,
-            aspect_ratio,
-        )
+        Camera::new(transform.col(3).xyz(), angles.2, angles.1, aspect_ratio)
+    }
+
+    pub fn set_transform(&mut self, transform: &Mat4) {
+        let angles = transform.to_euler(EulerRot::ZYX);
+        self.position = transform.col(3).xyz();
+        self.yaw = angles.2;
+        self.pitch = angles.1;
+    }
+
+    pub fn set_viewport(&mut self, width: u32, height: u32) {
+        self.aspect_ratio = width as f32 / height as f32;
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -65,6 +71,15 @@ impl Camera {
             self.z_near,
             self.z_far,
         )
+    }
+
+    pub fn uniform_data(&self) -> CameraUniform {
+        let projection = self.projection_matrix();
+        let view = self.view_matrix();
+
+        CameraUniform {
+            view_projection_inverse: (projection * view).inverse(),
+        }
     }
 }
 

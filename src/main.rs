@@ -3,11 +3,25 @@ pub mod pbrt;
 pub mod scene;
 
 use std::sync::Arc;
+use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+use crate::scene::MeshVertex;
+
+struct SceneData {
+    scene: scene::Scene,
+    scene_bind_group: wgpu::BindGroup,
+}
+
+struct RenderPipeline {
+    view_bind_group_layout: wgpu::BindGroupLayout,
+    view_bind_group: wgpu::BindGroup,
+    scene_bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
 
 struct State {
     window: Arc<Window>,
@@ -16,12 +30,61 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     surface_configured: bool,
+    scene_data: Option<SceneData>,
+    blitter: wgpu::util::TextureBlitter,
+    render_pipeline: RenderPipeline,
+    render_buffer_view: wgpu::TextureView,
+    camera_buffer: wgpu::Buffer,
+    camera: camera::Camera,
+}
 
-    scene: scene::Scene,
+fn create_render_buffer(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width, height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+
+    texture.create_view(&Default::default())
+}
+
+fn create_view_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buffer: &wgpu::Buffer,
+    render_buffer: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(render_buffer),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: camera_buffer.as_entire_binding()
+            }
+        ],
+    })
+}
+
+struct Struct {
+    x: i32,
+    b: bool,
 }
 
 impl State {
-    async fn new(window: Arc<Window>, scene: scene::Scene) -> anyhow::Result<State> {
+    async fn new(window: Arc<Window>) -> anyhow::Result<State> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -45,9 +108,9 @@ impl State {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                required_limits: wgpu::Limits::default(),
+                required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+                required_limits: wgpu::Limits::default().using_minimum_supported_acceleration_structure_values(),
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
             })
@@ -73,7 +136,7 @@ impl State {
         };
 
         let shader_module = device.create_shader_module(wgpu::include_wgsl!("render.wgsl"));
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let view_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -81,18 +144,32 @@ impl State {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: wgpu::TextureFormat::Rgba16Float,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let scene_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::AccelerationStructure {
+                        vertex_return: false,
                     },
                     count: None,
                 }
@@ -101,7 +178,10 @@ impl State {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[
+                Some(&view_bind_group_layout),
+                Some(&scene_bind_group_layout),
+            ],
             immediate_size: 0,
         });
 
@@ -114,6 +194,19 @@ impl State {
             cache: None,
         });
 
+        let render_buffer_view = create_render_buffer(&device, wgpu::TextureFormat::Rgba16Float, size.width, size.height);
+
+        let camera = camera::Camera::new(glam::Vec3::ZERO, 0.0, 0.0, size.width as f32 / size.height as f32);
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera.uniform_data()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let view_bind_group = create_view_group(&device, &view_bind_group_layout, &camera_buffer, &render_buffer_view);
+
+        let blitter = wgpu::util::TextureBlitter::new(&device, config.format);
+
         Ok(Self {
             window,
             surface,
@@ -121,8 +214,30 @@ impl State {
             queue,
             config,
             surface_configured: false,
-            scene,
+            scene_data: None,
+            blitter,
+            render_pipeline: RenderPipeline {
+                view_bind_group_layout,
+                view_bind_group,
+                scene_bind_group_layout,
+                pipeline,
+            },
+            render_buffer_view,
+            camera_buffer,
+            camera,
         })
+    }
+
+    fn update_camera_buffer(&self) {
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera.uniform_data()]));
+    }
+
+    fn recreate_view_group(&mut self) {
+        self.render_buffer_view = create_render_buffer(&self.device, wgpu::TextureFormat::Rgba16Float, self.config.width, self.config.height);
+
+        self.render_pipeline.view_bind_group = create_view_group(
+            &self.device, &self.render_pipeline.view_bind_group_layout,
+            &self.camera_buffer, &self.render_buffer_view);
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -131,6 +246,9 @@ impl State {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             self.surface_configured = true;
+
+            self.camera.set_viewport(width, height);
+            self.recreate_view_group();
         }
     }
 
@@ -146,33 +264,27 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
+        if self.scene_data.is_some() {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
                 timestamp_writes: None,
-                multiview_mask: None,
             });
+
+            pass.set_pipeline(&self.render_pipeline.pipeline);
+            pass.set_bind_group(0, &self.render_pipeline.view_bind_group, &[]);
+            pass.set_bind_group(1, &self.scene_data.as_ref().unwrap().scene_bind_group, &[]);
+
+            const WORKGROUP_SIZE: (u32, u32) = (8, 8);
+            pass.dispatch_workgroups(
+                self.config.width.div_ceil(WORKGROUP_SIZE.0),
+                self.config.height.div_ceil(WORKGROUP_SIZE.1),
+                1
+            );
         }
+
+        self.blitter.copy(&self.device, &mut encoder, &self.render_buffer_view, &view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -181,7 +293,7 @@ impl State {
     }
 
     fn update(&mut self) {
-        // todo!()
+        self.update_camera_buffer()
     }
 
     fn handle_key(&self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
@@ -189,6 +301,111 @@ impl State {
             (KeyCode::Escape, true) => event_loop.exit(),
             _ => {}
         }
+    }
+
+    fn load_scene(&mut self, scene: scene::Scene) {
+        self.camera.set_transform(&scene.camera_transformation);
+
+        log::info!("creating acceleration structures...");
+
+        let mut blases: Vec<Vec<_>> = Vec::new();
+
+        for object in &scene.objects {
+            blases.push(object.meshes.iter().map(|mesh| {
+                let geometry_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
+                    vertex_format: wgpu::VertexFormat::Float32x3,
+                    vertex_count: mesh.vertices.len() as u32,
+                    index_format: Some(wgpu::IndexFormat::Uint16),
+                    index_count: Some(mesh.indices.len() as u32),
+                    flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                };
+
+                (mesh, geometry_desc.clone(), self.device.create_blas(
+                    &wgpu::CreateBlasDescriptor {
+                        label: None,
+                        flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                        update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                    },
+                    wgpu::BlasGeometrySizeDescriptors::Triangles {
+                        descriptors: vec![geometry_desc],
+                    },
+                ))
+            }).collect());
+        }
+
+        let mut tlas = self.device.create_tlas(&wgpu::CreateTlasDescriptor {
+            label: None,
+            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            max_instances: scene.instances.iter().map(|i| blases[i.object].len() as u32).sum()
+        });
+
+        let mut store_index = 0;
+        for instance in &scene.instances {
+            for (_, _, blas) in &blases[instance.object] {
+                tlas[store_index] = Some(wgpu::TlasInstance::new(
+                    blas,
+                    instance.transform.transpose().to_cols_array()[..12].try_into().unwrap(),
+                    0, 0xFF
+                ));
+                store_index += 1;
+            }
+        }
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        for (mesh, geometry_desc, blas) in blases.iter().flat_map(std::convert::identity) {
+            let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::BLAS_INPUT,
+            });
+
+            let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
+            });
+
+            encoder.build_acceleration_structures(std::iter::once(&wgpu::BlasBuildEntry {
+                blas,
+                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![
+                    wgpu::BlasTriangleGeometry {
+                        size: geometry_desc,
+                        vertex_buffer: &vertex_buffer,
+                        first_vertex: 0,
+                        vertex_stride: size_of::<MeshVertex>() as u64,
+                        index_buffer: Some(&index_buffer),
+                        first_index: Some(0),
+                        transform_buffer: None,
+                        transform_buffer_offset: None,
+                    }
+                ]),
+            }), std::iter::empty());
+        }
+
+        encoder.build_acceleration_structures(std::iter::empty(), std::iter::once(&tlas));
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        log::info!("built {} blases and {} tlas instances.", blases.iter().map(Vec::len).sum::<usize>(), scene.instances.len());
+
+        let scene_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.render_pipeline.scene_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::AccelerationStructure(&tlas),
+                }
+            ],
+        });
+
+        self.scene_data = Some(SceneData {
+            scene,
+            scene_bind_group,
+        });
     }
 }
 
@@ -207,9 +424,12 @@ impl ApplicationHandler<State> for Application {
         let window_attributes = Window::default_attributes();
         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
 
+        self.state = Some(pollster::block_on(State::new(window)).unwrap());
+
         let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new(
             "/Users/jnngl/Desktop/pbrt-v4-scenes/bmw-m6/bmw-m6.pbrt",
-        )).unwrap();
+        ))
+            .unwrap();
         let mut state = pbrt::parser::ParseState {
             working_directory: tokenizer.directory.clone(),
             ..Default::default()
@@ -217,7 +437,7 @@ impl ApplicationHandler<State> for Application {
 
         let scene = state.parse(&mut tokenizer).unwrap();
 
-        self.state = Some(pollster::block_on(State::new(window, scene)).unwrap());
+        self.state.as_mut().unwrap().load_scene(scene);
     }
 
     fn window_event(

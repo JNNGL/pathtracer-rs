@@ -1,6 +1,7 @@
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec3};
 
-#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
     pub position: Vec3,
 }
@@ -8,7 +9,7 @@ pub struct MeshVertex {
 #[derive(Debug, Clone)]
 pub struct Mesh {
     pub vertices: Vec<MeshVertex>,
-    pub indices: Vec<u32>,
+    pub indices: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,24 +23,26 @@ pub struct ObjectInstance {
 }
 
 pub struct Scene {
-    pub meshes: Vec<SceneObject>,
+    pub objects: Vec<SceneObject>,
     pub instances: Vec<ObjectInstance>,
+    pub camera_transformation: Mat4,
 }
 
 impl Scene {
     pub fn new() -> Self {
         Self {
-            meshes: Vec::new(),
+            objects: Vec::new(),
             instances: Vec::new(),
+            camera_transformation: Mat4::IDENTITY,
         }
     }
 
-    pub fn add_mesh(&mut self, object: SceneObject) -> usize {
-        self.meshes.push(object);
-        self.meshes.len() - 1
+    pub fn add_object(&mut self, object: SceneObject) -> usize {
+        self.objects.push(object);
+        self.objects.len() - 1
     }
 
-    pub fn add_mesh_instance(&mut self, mesh_instance: ObjectInstance) {
-        self.instances.push(mesh_instance);
+    pub fn add_object_instance(&mut self, object_instance: ObjectInstance) {
+        self.instances.push(object_instance);
     }
 }

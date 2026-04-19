@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::pbrt::Tokenizer;
 use crate::scene::*;
+use ply_rs::ply::{DefaultElement, Property};
 
 #[derive(Debug, Clone, strum::Display)]
 pub enum ParameterValue {
@@ -1967,23 +1968,196 @@ impl Default for ParseState {
     }
 }
 
-fn create_ply_mesh(filename: &String, transform: &Transformation) -> Mesh {
-    let vertices = Vec::<MeshVertex>::new();
-    let indices = Vec::<u32>::new();
-
-    Mesh { vertices, indices }
+fn read_ply_scalar(property: &Property) -> Option<f32> {
+    match property {
+        Property::Char(value) => Some(*value as f32),
+        Property::UChar(value) => Some(*value as f32),
+        Property::Short(value) => Some(*value as f32),
+        Property::UShort(value) => Some(*value as f32),
+        Property::Int(value) => Some(*value as f32),
+        Property::UInt(value) => Some(*value as f32),
+        Property::Float(value) => Some(*value),
+        Property::Double(value) => Some(*value as f32),
+        _ => None,
+    }
 }
 
-fn create_scene_mesh(shape: &Shape, transform: &Transformation) -> Mesh {
+fn read_ply_vertex_component(
+    vertex: &DefaultElement,
+    property_name: &str,
+    vertex_index: usize,
+    path: &Path,
+) -> Result<f32, String> {
+    vertex
+        .get(property_name)
+        .and_then(read_ply_scalar)
+        .ok_or_else(|| {
+            format!(
+                "PLY mesh {} is missing a valid '{}' property for vertex {}",
+                path.display(),
+                property_name,
+                vertex_index
+            )
+        })
+}
+
+fn convert_ply_index_list<T>(
+    values: &[T],
+    path: &Path,
+    face_index: usize,
+) -> Result<Vec<u32>, String>
+where
+    T: Copy + TryInto<i64>,
+{
+    values
+        .iter()
+        .map(|value| {
+            let value = (*value).try_into().map_err(|_| {
+                format!(
+                    "PLY mesh {} contains an out-of-range vertex index in face {}",
+                    path.display(),
+                    face_index
+                )
+            })?;
+
+            u32::try_from(value).map_err(|_| {
+                format!(
+                    "PLY mesh {} contains a negative vertex index in face {}",
+                    path.display(),
+                    face_index
+                )
+            })
+        })
+        .collect()
+}
+
+fn read_ply_face_indices(
+    face: &DefaultElement,
+    face_index: usize,
+    vertex_count: usize,
+    path: &Path,
+) -> Result<Vec<u32>, String> {
+    let indices = match face
+        .get("vertex_indices")
+        .or_else(|| face.get("vertex_index"))
+    {
+        Some(Property::ListChar(values)) => convert_ply_index_list(values, path, face_index)?,
+        Some(Property::ListUChar(values)) => convert_ply_index_list(values, path, face_index)?,
+        Some(Property::ListShort(values)) => convert_ply_index_list(values, path, face_index)?,
+        Some(Property::ListUShort(values)) => convert_ply_index_list(values, path, face_index)?,
+        Some(Property::ListInt(values)) => convert_ply_index_list(values, path, face_index)?,
+        Some(Property::ListUInt(values)) => convert_ply_index_list(values, path, face_index)?,
+        Some(_) => {
+            return Err(format!(
+                "PLY mesh {} has a face {} with an unsupported vertex index list type",
+                path.display(),
+                face_index
+            ));
+        }
+        None => {
+            return Err(format!(
+                "PLY mesh {} is missing 'vertex_indices' or 'vertex_index' on face {}",
+                path.display(),
+                face_index
+            ));
+        }
+    };
+
+    if indices.len() < 3 {
+        return Err(format!(
+            "PLY mesh {} has a face {} with fewer than 3 vertices",
+            path.display(),
+            face_index
+        ));
+    }
+
+    for &index in &indices {
+        if index as usize >= vertex_count {
+            return Err(format!(
+                "PLY mesh {} references vertex {} in face {}, but only {} vertices exist",
+                path.display(),
+                index,
+                face_index,
+                vertex_count
+            ));
+        }
+    }
+
+    Ok(indices)
+}
+
+fn create_ply_mesh(
+    filename: &str,
+    working_directory: &Path,
+    transform: &Transformation,
+) -> Result<Mesh, String> {
+    log::info!("loading ply mesh: {}", filename);
+
+    let path = working_directory.join(filename);
+    let file = std::fs::File::open(&path)
+        .map_err(|error| format!("failed to open ply mesh {}: {}", filename, error))?;
+    let mut reader: Box<dyn std::io::Read> = if path.extension().is_some_and(|ext| ext == "gz") {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+
+    let parser = ply_rs::parser::Parser::<DefaultElement>::new();
+    let ply = parser
+        .read_ply(&mut reader)
+        .map_err(|error| format!("failed to parse ply mesh {}: {}", filename, error))?;
+
+    let vertex_elements = ply
+        .payload
+        .get("vertex")
+        .ok_or_else(|| format!("ply mesh {} is missing a vertex element", path.display()))?;
+    let mut vertices = Vec::with_capacity(vertex_elements.len());
+
+    for (vertex_index, vertex) in vertex_elements.iter().enumerate() {
+        let position = glam::vec3(
+            read_ply_vertex_component(vertex, "x", vertex_index, &path)?,
+            read_ply_vertex_component(vertex, "y", vertex_index, &path)?,
+            read_ply_vertex_component(vertex, "z", vertex_index, &path)?,
+        );
+
+        vertices.push(MeshVertex {
+            position: transform.matrix.transform_point3(position),
+        });
+    }
+
+    let face_elements = ply
+        .payload
+        .get("face")
+        .ok_or_else(|| format!("ply mesh {} is missing a face element", filename))?;
+    let mut indices = Vec::new();
+
+    for (face_index, face) in face_elements.iter().enumerate() {
+        let face_indices = read_ply_face_indices(face, face_index, vertices.len(), &path)?;
+
+        for triangle in face_indices[1..].windows(2) {
+            indices.extend([face_indices[0] as u16, triangle[0] as u16, triangle[1] as u16]);
+        }
+    }
+
+    log::info!("loaded {} vertices and {} faces.", vertices.len(), indices.len() / 3);
+
+    Ok(Mesh { vertices, indices })
+}
+
+fn create_scene_mesh(
+    shape: &Shape,
+    working_directory: &Path,
+    transform: &Transformation,
+) -> Result<Mesh, String> {
     match shape {
-        Shape::PlyMesh {
-            filename,
-            ..
-        } => create_ply_mesh(filename, transform),
+        Shape::PlyMesh { filename, .. } => create_ply_mesh(filename, working_directory, transform),
 
         _ => {
             log::warn!("unsupported shape type: {}", shape);
-            Mesh { vertices: vec![], indices: vec![] }
+            Ok(Mesh {
+                vertices: vec![],
+                indices: vec![],
+            })
         }
     }
 }
@@ -2003,7 +2177,7 @@ impl ParseState {
                 let mut tokenizer = Tokenizer::create_from_file(path.as_path())
                     .map_err(|_| format!("failed to open file: {}", file))?;
 
-                self.parse(&mut tokenizer)?;
+                self.parse_into(scene, &mut tokenizer)?;
             }
             Directive::Import(file) => {
                 let path = self.working_directory.join(&file);
@@ -2012,7 +2186,7 @@ impl ParseState {
 
                 let mut state = self.clone();
 
-                state.parse(&mut tokenizer)?;
+                state.parse_into(scene, &mut tokenizer)?;
             }
 
             // Attributes
@@ -2091,7 +2265,7 @@ impl ParseState {
                 self.current_object = Some(SceneObject { meshes: Vec::new() })
             }
             Directive::ObjectEnd => {
-                let index = scene.add_mesh(self.current_object.take().unwrap());
+                let index = scene.add_object(self.current_object.take().unwrap());
                 self.objects
                     .insert(self.current_object_name.take().unwrap(), index);
             }
@@ -2107,18 +2281,28 @@ impl ParseState {
                     .objects
                     .get(&name)
                     .ok_or_else(|| format!("object not found: {}", name))?;
-                scene.add_mesh_instance(ObjectInstance {
+                scene.add_object_instance(ObjectInstance {
                     object: index,
                     transform: state.transformation.matrix.clone(),
                 })
             }
 
             Directive::Shape { shape, .. } => {
-                let mesh = create_scene_mesh(&shape, &state.transformation);
+                let mesh = create_scene_mesh(
+                    &shape,
+                    self.working_directory.as_path(),
+                    &Transformation::default(),
+                )?;
 
                 match &mut self.current_object {
                     Some(object) => object.meshes.push(mesh),
-                    None => _ = scene.add_mesh(SceneObject { meshes: vec![mesh] }),
+                    None => _ = {
+                        let id = scene.add_object(SceneObject { meshes: vec![mesh] });
+                        scene.add_object_instance(ObjectInstance {
+                            object: id,
+                            transform: state.transformation.matrix.clone(),
+                        })
+                    },
                 }
             }
 
@@ -2130,14 +2314,12 @@ impl ParseState {
         Ok(())
     }
 
-    pub fn parse(self: &mut Self, tokenizer: &mut Tokenizer) -> Result<Scene, String> {
-        let mut scene = Scene::new();
-
-        loop {
+    fn parse_into(&mut self, scene: &mut Scene, tokenizer: &mut Tokenizer) -> Result<(), String> {
+        let result = loop {
             let directive = match parse_directive(self.graphics_state.last().unwrap(), tokenizer) {
                 Ok(directive) => directive,
                 Err(message) => {
-                    return Err(format!(
+                    break Err(format!(
                         "Error parsing {} at line {}: {}",
                         tokenizer.file.to_str().unwrap_or("<?>"),
                         tokenizer.loc.line,
@@ -2147,10 +2329,23 @@ impl ParseState {
             };
 
             match directive {
-                Some(directive) => self.apply_directive(&mut scene, directive)?,
-                None => break,
+                Some(directive) => {
+                    if let Err(error) = self.apply_directive(scene, directive) {
+                        break Err(error);
+                    }
+                }
+                None => break Ok(()),
             }
-        }
+        };
+
+        result
+    }
+
+    pub fn parse(self: &mut Self, tokenizer: &mut Tokenizer) -> Result<Scene, String> {
+        let mut scene = Scene::new();
+        self.parse_into(&mut scene, tokenizer)?;
+
+        scene.camera_transformation = self.camera_transform.matrix;
 
         Ok(scene)
     }
