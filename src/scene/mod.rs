@@ -9,7 +9,7 @@ pub struct MeshVertex {
 #[derive(Debug, Clone)]
 pub struct Mesh {
     pub vertices: Vec<MeshVertex>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,7 @@ pub struct Scene {
     pub objects: Vec<SceneObject>,
     pub instances: Vec<ObjectInstance>,
     pub camera_transformation: Mat4,
+    pub camera_fov: f32,
 }
 
 impl Scene {
@@ -34,6 +35,7 @@ impl Scene {
             objects: Vec::new(),
             instances: Vec::new(),
             camera_transformation: Mat4::IDENTITY,
+            camera_fov: 45.0f32.to_radians(),
         }
     }
 

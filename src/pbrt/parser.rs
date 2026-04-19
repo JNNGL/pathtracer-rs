@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
 use crate::pbrt::Tokenizer;
 use crate::scene::*;
 use ply_rs::ply::{DefaultElement, Property};
@@ -196,6 +195,8 @@ pub enum Shape {
         displacement: Option<TextureRef>,
         edge_length: f32,
     },
+    Loopsubdiv,
+    BilinearMesh,
 }
 
 #[derive(Debug)]
@@ -242,8 +243,8 @@ pub struct BumpNormalMap {
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct Roughness {
-    u: f32,
-    v: f32,
+    u: TextureRef,
+    v: TextureRef,
     remap: bool,
 }
 
@@ -253,7 +254,7 @@ pub struct Coating {
     pub asymmetry: TextureRef,
     pub max_depth: i32,
     pub samples: i32,
-    pub thickness: f32,
+    pub thickness: TextureRef,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +272,7 @@ pub enum Material {
         coating: Coating,
         eta: Spectrum,
         k: Spectrum,
-        reflectance: Option<Spectrum>,
+        reflectance: Option<TextureRef>,
     },
     Conductor {
         normal: BumpNormalMap,
@@ -497,7 +498,6 @@ pub enum Directive {
     Import(String),
     Option(NamedParameter), // TODO
     Camera {
-        // TODO
         camera: CameraType,
         shutter_open: f32,
         shutter_close: f32,
@@ -771,11 +771,13 @@ fn parse_named_parameter(tokenizer: &mut Tokenizer) -> Result<Option<NamedParame
         })),
         "blackbody" => Ok(Some(NamedParameter {
             name: String::from(name),
-            value: ParameterValue::Spectrum(Spectrum::Blackbody(expect_float(tokenizer)?)),
+            value: ParameterValue::Spectrum(Spectrum::Blackbody(*parse_vector::<f32>(tokenizer)?
+                .first().ok_or("expected at least one element")?)),
         })),
         "texture" => Ok(Some(NamedParameter {
             name: String::from(name),
-            value: ParameterValue::Texture(expect_string(tokenizer)?),
+            value: ParameterValue::Texture(parse_vector::<String>(tokenizer)?.first()
+                .ok_or("expected at least one element")?.clone()),
         })),
         _ => Err(format!("invalid parameter type: {}", param_type)),
     }
@@ -978,21 +980,21 @@ fn parse_bump_normal_map(
 macro_rules! parse_roughness {
     ($state:ident, $parameters:ident, $prefix:literal) => {{
         let roughness = $parameters
-            .get_float(
+            .get_texture_ref(
                 concat!($prefix, "roughness"),
                 Some(&$state.material_attributes),
             )?
-            .unwrap_or(0.0);
+            .unwrap_or(TextureRef::Float(0.0));
 
         Ok::<Roughness, String>(Roughness {
             u: $parameters
-                .get_float(
+                .get_texture_ref(
                     concat!($prefix, "uroughness"),
                     Some(&$state.material_attributes),
                 )?
-                .unwrap_or(roughness),
+                .unwrap_or(roughness.clone()),
             v: $parameters
-                .get_float(
+                .get_texture_ref(
                     concat!($prefix, "vroughness"),
                     Some(&$state.material_attributes),
                 )?
@@ -1025,8 +1027,8 @@ fn parse_coating(
             .get_integer("nsamples", Some(&state.material_attributes))?
             .unwrap_or(1),
         thickness: parameters
-            .get_float("thickness", Some(&state.material_attributes))?
-            .unwrap_or(0.01),
+            .get_texture_ref("thickness", Some(&state.material_attributes))?
+            .unwrap_or(TextureRef::Float(0.01)),
     })
 }
 
@@ -1069,7 +1071,7 @@ fn parse_material(
                 .get_spectrum("conductor.k", Some(&state.material_attributes))?
                 .unwrap_or_else(|| Spectrum::Named("metal-Cu-k".to_string())),
             reflectance: parameters
-                .get_spectrum("reflectance", Some(&state.material_attributes))?,
+                .get_texture_ref("reflectance", Some(&state.material_attributes))?,
             coating: parse_coating(&state, &parameters)?,
         }),
         "conductor" => Ok(Material::Conductor {
@@ -1325,7 +1327,7 @@ pub fn parse_directive(
                     "sobol" => SamplerType::Sobol,
                     "stratified" => SamplerType::Stratified,
                     "zsobol" => SamplerType::ZSobol,
-                    _ => return Err(format!("invalid sampler: {}", sampler)),
+                    _ => SamplerType::Halton,
                 },
                 seed: parameters.get_integer("seed", None)?.unwrap_or(0),
             }))
@@ -1570,6 +1572,8 @@ pub fn parse_directive(
                             .get_float("edgelength", Some(&state.shape_attributes))?
                             .unwrap_or(1.0),
                     },
+                    "loopsubdiv" => Shape::Loopsubdiv,
+                    "bilinearmesh" => Shape::BilinearMesh,
                     _ => return Err(format!("invalid shape type: {}", name)),
                 },
                 alpha: parameters
@@ -1921,6 +1925,12 @@ pub fn parse_directive(
             let _ = expect_string(tokenizer)?;
 
             Ok(Some(Directive::Unimplemented("MediumInterface")))
+        },
+        "MakeNamedMedium" => {
+            let _ = expect_string(tokenizer)?;
+            let _ = parse_parameter_list(tokenizer)?;
+
+            Ok(Some(Directive::Unimplemented("MakeNamedMedium")))
         }
         _ => Err(format!("unrecognized directive: {}", t.token)),
     }
@@ -2086,6 +2096,102 @@ fn read_ply_face_indices(
     Ok(indices)
 }
 
+fn create_triangle_mesh(
+    positions: &[glam::Vec3],
+    indices: &Option<Vec<i32>>,
+    normals: &Option<Vec<glam::Vec3>>,
+    tangents: &Option<Vec<glam::Vec3>>,
+    uvs: &Option<Vec<glam::Vec2>>,
+    transform: &Transformation,
+) -> Result<Mesh, String> {
+    if let Some(normals) = normals {
+        if normals.len() != positions.len() {
+            return Err(format!(
+                "trianglemesh has {} vertex positions but {} normals",
+                positions.len(),
+                normals.len()
+            ));
+        }
+    }
+
+    if let Some(tangents) = tangents {
+        if tangents.len() != positions.len() {
+            return Err(format!(
+                "trianglemesh has {} vertex positions but {} tangents",
+                positions.len(),
+                tangents.len()
+            ));
+        }
+    }
+
+    if let Some(uvs) = uvs {
+        if uvs.len() != positions.len() {
+            return Err(format!(
+                "trianglemesh has {} vertex positions but {} uvs",
+                positions.len(),
+                uvs.len()
+            ));
+        }
+    }
+
+    if positions.len() > u16::MAX as usize {
+        return Err(format!(
+            "trianglemesh has {} vertices, but only {} are supported",
+            positions.len(),
+            u16::MAX
+        ));
+    }
+
+    let vertices = positions
+        .iter()
+        .map(|position| MeshVertex {
+            position: transform.matrix.transform_point3(*position),
+        })
+        .collect();
+
+    let indices = match indices {
+        Some(indices) => {
+            if indices.len() % 3 != 0 {
+                return Err(format!(
+                    "trianglemesh index count must be divisible by 3, got {}",
+                    indices.len()
+                ));
+            }
+
+            let mut converted = Vec::with_capacity(indices.len());
+            for &index in indices {
+                let index = usize::try_from(index)
+                    .map_err(|_| format!("trianglemesh contains a negative vertex index: {}", index))?;
+
+                if index >= positions.len() {
+                    return Err(format!(
+                        "trianglemesh references vertex {}, but only {} vertices exist",
+                        index,
+                        positions.len()
+                    ));
+                }
+
+                converted.push(index as u32);
+            }
+            converted
+        }
+        None => {
+            if positions.len() % 3 != 0 {
+                return Err(format!(
+                    "trianglemesh without indices requires vertex count divisible by 3, got {}",
+                    positions.len()
+                ));
+            }
+
+            (0..positions.len())
+                .map(|index| index as u32)
+                .collect()
+        }
+    };
+
+    Ok(Mesh { vertices, indices })
+}
+
 fn create_ply_mesh(
     filename: &str,
     working_directory: &Path,
@@ -2135,7 +2241,7 @@ fn create_ply_mesh(
         let face_indices = read_ply_face_indices(face, face_index, vertices.len(), &path)?;
 
         for triangle in face_indices[1..].windows(2) {
-            indices.extend([face_indices[0] as u16, triangle[0] as u16, triangle[1] as u16]);
+            indices.extend([face_indices[0], triangle[0], triangle[1]]);
         }
     }
 
@@ -2150,6 +2256,13 @@ fn create_scene_mesh(
     transform: &Transformation,
 ) -> Result<Mesh, String> {
     match shape {
+        Shape::TriangleMesh {
+            indices,
+            vertices,
+            normals,
+            tangents,
+            uvs
+        } => create_triangle_mesh(vertices, indices, normals, tangents, uvs, transform),
         Shape::PlyMesh { filename, .. } => create_ply_mesh(filename, working_directory, transform),
 
         _ => {
@@ -2160,6 +2273,19 @@ fn create_scene_mesh(
             })
         }
     }
+}
+
+fn look_at(eye: glam::Vec3, look: glam::Vec3, up: glam::Vec3) -> glam::Mat4 {
+    let direction = (look - eye).normalize();
+    let left = up.normalize_or_zero().cross(direction).normalize_or_zero();
+    let new_up = direction.cross(left);
+
+    glam::Mat4::from_cols(
+        left.extend(0.0),
+        new_up.extend(0.0),
+        direction.extend(0.0),
+        eye.extend(1.0),
+    ).inverse()
 }
 
 impl ParseState {
@@ -2233,9 +2359,21 @@ impl ParseState {
                 let matrix = glam::Mat4::from_quat(glam::Quat::from_axis_angle(axis, angle));
                 state.transformation.matrix *= matrix;
             }
+            Directive::LookAt { eye, look, up } => {
+                let matrix = look_at(eye, look, up);
+                state.transformation.matrix *= matrix;
+            }
             Directive::Scale(scale) => {
                 state.transformation.matrix *= glam::Mat4::from_scale(scale);
             }
+            Directive::Camera { camera, .. } => match camera {
+                CameraType::Perspective { fov, .. } => {
+                    scene.camera_fov = fov.to_radians();
+                }
+                unsupported => {
+                    log::warn!("unsupported camera type {:?}, using perspective defaults", unsupported);
+                }
+            },
 
             // Coordinate Systems
             Directive::CoordinateSystem { name } => {
@@ -2291,18 +2429,25 @@ impl ParseState {
                 let mesh = create_scene_mesh(
                     &shape,
                     self.working_directory.as_path(),
-                    &Transformation::default(),
+                    &match self.current_object.is_some() {
+                        true => state.transformation.clone(),
+                        false => Transformation::default()
+                    },
                 )?;
 
-                match &mut self.current_object {
-                    Some(object) => object.meshes.push(mesh),
-                    None => _ = {
-                        let id = scene.add_object(SceneObject { meshes: vec![mesh] });
-                        scene.add_object_instance(ObjectInstance {
-                            object: id,
-                            transform: state.transformation.matrix.clone(),
-                        })
-                    },
+                if mesh.vertices.len() > 0 {
+                    match &mut self.current_object {
+                        Some(object) => object.meshes.push(mesh),
+                        None => _ = {
+                            let id = scene.add_object(SceneObject { meshes: vec![mesh] });
+                            scene.add_object_instance(ObjectInstance {
+                                object: id,
+                                transform: state.transformation.matrix.clone(),
+                            })
+                        },
+                    }
+                } else {
+                    log::warn!("empty object");
                 }
             }
 

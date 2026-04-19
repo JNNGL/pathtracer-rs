@@ -1,7 +1,8 @@
 enable wgpu_ray_query;
 
 struct CameraUniform {
-    view_projection_inverse: mat4x4<f32>,
+    view_inverse: mat4x4<f32>,
+    projection_inverse: mat4x4<f32>,
 }
 
 @group(0) @binding(0)
@@ -21,13 +22,13 @@ fn main(@builtin(global_invocation_id) dispatch_id: vec3u) {
         return;
     }
 
-    let uv = (vec2f(dispatch_id.xy) + 0.5) / vec2f(texture_dim);
+    let pixel_center = vec2f(dispatch_id.xy) + vec2f(0.5);
+    let uv = pixel_center / vec2f(texture_dim);
+    let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
-    let near_point = camera.view_projection_inverse * vec4f(uv * 2.0 - 1.0, -1.0, 1.0);
-    let far_point = camera.view_projection_inverse * vec4f(uv * 2.0 - 1.0, 1.0, 1.0);
-
-    let origin = near_point.xyz / near_point.w;
-    let direction = normalize(far_point.xyz / far_point.w - origin);
+    let origin = (camera.view_inverse * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+    let view_direction = camera.projection_inverse * vec4f(ndc, 1.0, 1.0);
+    let direction = normalize((camera.view_inverse * vec4f(normalize(view_direction.xyz), 0.0)).xyz);
 
     var query: ray_query;
     rayQueryInitialize(&query, scene, RayDesc(0u, 0xFFu, 1.0e-3, 1.0e6, origin, direction));

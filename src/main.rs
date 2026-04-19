@@ -3,12 +3,13 @@ pub mod pbrt;
 pub mod scene;
 
 use std::sync::Arc;
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::event::{KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::scene::MeshVertex;
 
 struct SceneData {
@@ -36,6 +37,8 @@ struct State {
     render_buffer_view: wgpu::TextureView,
     camera_buffer: wgpu::Buffer,
     camera: camera::Camera,
+    camera_controller: camera::CameraController,
+    last_update: Instant,
 }
 
 fn create_render_buffer(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> wgpu::TextureView {
@@ -78,11 +81,6 @@ fn create_view_group(
     })
 }
 
-struct Struct {
-    x: i32,
-    b: bool,
-}
-
 impl State {
     async fn new(window: Arc<Window>) -> anyhow::Result<State> {
         let size = window.inner_size();
@@ -110,7 +108,10 @@ impl State {
                 label: None,
                 required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
-                required_limits: wgpu::Limits::default().using_minimum_supported_acceleration_structure_values(),
+                required_limits: wgpu::Limits {
+                    max_buffer_size: 1 << 32,
+                    ..wgpu::Limits::default()
+                }.using_minimum_supported_acceleration_structure_values(),
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
             })
@@ -196,7 +197,7 @@ impl State {
 
         let render_buffer_view = create_render_buffer(&device, wgpu::TextureFormat::Rgba16Float, size.width, size.height);
 
-        let camera = camera::Camera::new(glam::Vec3::ZERO, 0.0, 0.0, size.width as f32 / size.height as f32);
+        let camera = camera::Camera::new(glam::Vec3::ZERO, 0.0, 0.0, 0.0, size.width as f32 / size.height as f32);
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
             contents: bytemuck::cast_slice(&[camera.uniform_data()]),
@@ -225,6 +226,8 @@ impl State {
             render_buffer_view,
             camera_buffer,
             camera,
+            camera_controller: camera::CameraController::new(6.0, 0.0025),
+            last_update: Instant::now(),
         })
     }
 
@@ -293,58 +296,138 @@ impl State {
     }
 
     fn update(&mut self) {
+        let now = Instant::now();
+        let delta_time = now - self.last_update;
+        self.last_update = now;
+
+        self.camera_controller.update_camera(&mut self.camera, delta_time);
         self.update_camera_buffer()
     }
 
-    fn handle_key(&self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
-        match (code, is_pressed) {
-            (KeyCode::Escape, true) => event_loop.exit(),
+    fn set_mouse_capture(&mut self, captured: bool) {
+        if captured {
+            let grab_result = self
+                .window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Confined));
+
+            if let Err(error) = grab_result {
+                log::warn!("unable to grab cursor: {}", error);
+                return;
+            }
+        } else if let Err(error) = self.window.set_cursor_grab(CursorGrabMode::None) {
+            log::warn!("unable to release cursor grab: {}", error);
+        }
+
+        self.window.set_cursor_visible(!captured);
+        self.camera_controller.set_mouse_captured(captured);
+    }
+
+    fn handle_mouse_motion(&mut self, delta_x: f64, delta_y: f64) {
+        self.camera_controller
+            .process_mouse_motion(&mut self.camera, delta_x, delta_y);
+    }
+
+    fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        if button == MouseButton::Left && state == ElementState::Pressed {
+            self.set_mouse_capture(true);
+        }
+    }
+
+    fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
+        if self.camera_controller.set_key_pressed(code, is_pressed) {
+            return;
+        }
+
+        if !is_pressed {
+            return;
+        }
+
+        match code {
+            KeyCode::Escape if self.camera_controller.mouse_captured() => self.set_mouse_capture(false),
+            KeyCode::Escape => event_loop.exit(),
             _ => {}
         }
     }
 
     fn load_scene(&mut self, scene: scene::Scene) {
+        struct MeshBuildInput {
+            size: wgpu::BlasTriangleGeometrySizeDescriptor,
+            vertex_buffer: wgpu::Buffer,
+            index_buffer: wgpu::Buffer,
+            blas: wgpu::Blas,
+            object_index: usize,
+        }
+
         self.camera.set_transform(&scene.camera_transformation);
+        self.camera.set_fov(scene.camera_fov);
+        self.last_update = Instant::now();
 
         log::info!("creating acceleration structures...");
 
-        let mut blases: Vec<Vec<_>> = Vec::new();
+        let mut mesh_build_inputs = Vec::new();
 
-        for object in &scene.objects {
-            blases.push(object.meshes.iter().map(|mesh| {
-                let geometry_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
+        for (object_index, object) in scene.objects.iter().enumerate() {
+            for mesh in &object.meshes {
+                let size = wgpu::BlasTriangleGeometrySizeDescriptor {
                     vertex_format: wgpu::VertexFormat::Float32x3,
                     vertex_count: mesh.vertices.len() as u32,
-                    index_format: Some(wgpu::IndexFormat::Uint16),
+                    index_format: Some(wgpu::IndexFormat::Uint32),
                     index_count: Some(mesh.indices.len() as u32),
                     flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
                 };
 
-                (mesh, geometry_desc.clone(), self.device.create_blas(
+                let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("BLAS Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&mesh.vertices),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::BLAS_INPUT,
+                });
+
+                let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("BLAS Index Buffer"),
+                    contents: bytemuck::cast_slice(&mesh.indices),
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
+                });
+
+                let blas = self.device.create_blas(
                     &wgpu::CreateBlasDescriptor {
                         label: None,
                         flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
                         update_mode: wgpu::AccelerationStructureUpdateMode::Build,
                     },
                     wgpu::BlasGeometrySizeDescriptors::Triangles {
-                        descriptors: vec![geometry_desc],
+                        descriptors: vec![size.clone()],
                     },
-                ))
-            }).collect());
+                );
+
+                mesh_build_inputs.push(MeshBuildInput {
+                    size,
+                    vertex_buffer,
+                    index_buffer,
+                    blas,
+                    object_index,
+                });
+            }
         }
 
         let mut tlas = self.device.create_tlas(&wgpu::CreateTlasDescriptor {
             label: None,
             flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
             update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-            max_instances: scene.instances.iter().map(|i| blases[i.object].len() as u32).sum()
+            max_instances: scene.instances.iter().map(
+                |instance| mesh_build_inputs.iter()
+                    .filter(|input| input.object_index == instance.object)
+                    .count() as u32).sum(),
         });
 
         let mut store_index = 0;
         for instance in &scene.instances {
-            for (_, _, blas) in &blases[instance.object] {
+            for build_input in mesh_build_inputs
+                .iter()
+                .filter(|build_input| build_input.object_index == instance.object)
+            {
                 tlas[store_index] = Some(wgpu::TlasInstance::new(
-                    blas,
+                    &build_input.blas,
                     instance.transform.transpose().to_cols_array()[..12].try_into().unwrap(),
                     0, 0xFF
                 ));
@@ -353,43 +436,42 @@ impl State {
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-        for (mesh, geometry_desc, blas) in blases.iter().flat_map(std::convert::identity) {
-            let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::BLAS_INPUT,
-            });
-
-            let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
-            });
-
-            encoder.build_acceleration_structures(std::iter::once(&wgpu::BlasBuildEntry {
-                blas,
+        let blas_build_entries: Vec<_> = mesh_build_inputs
+            .iter()
+            .map(|build_input| wgpu::BlasBuildEntry {
+                blas: &build_input.blas,
                 geometry: wgpu::BlasGeometries::TriangleGeometries(vec![
                     wgpu::BlasTriangleGeometry {
-                        size: geometry_desc,
-                        vertex_buffer: &vertex_buffer,
+                        size: &build_input.size,
+                        vertex_buffer: &build_input.vertex_buffer,
                         first_vertex: 0,
                         vertex_stride: size_of::<MeshVertex>() as u64,
-                        index_buffer: Some(&index_buffer),
+                        index_buffer: Some(&build_input.index_buffer),
                         first_index: Some(0),
                         transform_buffer: None,
                         transform_buffer_offset: None,
                     }
                 ]),
-            }), std::iter::empty());
-        }
+            })
+            .collect();
 
-        encoder.build_acceleration_structures(std::iter::empty(), std::iter::once(&tlas));
+        encoder.build_acceleration_structures(blas_build_entries.iter(), std::iter::once(&tlas));
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
 
-        log::info!("built {} blases and {} tlas instances.", blases.iter().map(Vec::len).sum::<usize>(), scene.instances.len());
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
+            log::error!("acceleration structure build failed validation: {}", error);
+            return;
+        }
+
+        log::info!(
+            "built {} blases and {} tlas instances.",
+            mesh_build_inputs.len(),
+            scene.instances.len()
+        );
 
         let scene_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -427,9 +509,8 @@ impl ApplicationHandler<State> for Application {
         self.state = Some(pollster::block_on(State::new(window)).unwrap());
 
         let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new(
-            "/Users/jnngl/Desktop/pbrt-v4-scenes/bmw-m6/bmw-m6.pbrt",
-        ))
-            .unwrap();
+            "/Users/jnngl/Desktop/pbrt-v4-scenes/kroken/camera-1.pbrt",
+        )).unwrap();
         let mut state = pbrt::parser::ParseState {
             working_directory: tokenizer.directory.clone(),
             ..Default::default()
@@ -453,6 +534,10 @@ impl ApplicationHandler<State> for Application {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                state.camera_controller.clear_input();
+                state.set_mouse_capture(false);
+            }
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 state.update();
@@ -476,7 +561,26 @@ impl ApplicationHandler<State> for Application {
                     },
                 ..
             } => state.handle_key(event_loop, code, key_state.is_pressed()),
+            WindowEvent::MouseInput { state: mouse_state, button, .. } => {
+                state.handle_mouse_button(button, mouse_state)
+            }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        let state = match &mut self.state {
+            Some(state) => state,
+            None => return,
+        };
+
+        if let DeviceEvent::MouseMotion { delta } = event {
+            state.handle_mouse_motion(delta.0, delta.1);
         }
     }
 }
