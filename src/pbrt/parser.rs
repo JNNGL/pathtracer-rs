@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use crate::pbrt::Tokenizer;
 use crate::scene::*;
 use ply_rs::ply::{DefaultElement, Property};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, strum::Display)]
 pub enum ParameterValue {
@@ -771,13 +771,20 @@ fn parse_named_parameter(tokenizer: &mut Tokenizer) -> Result<Option<NamedParame
         })),
         "blackbody" => Ok(Some(NamedParameter {
             name: String::from(name),
-            value: ParameterValue::Spectrum(Spectrum::Blackbody(*parse_vector::<f32>(tokenizer)?
-                .first().ok_or("expected at least one element")?)),
+            value: ParameterValue::Spectrum(Spectrum::Blackbody(
+                *parse_vector::<f32>(tokenizer)?
+                    .first()
+                    .ok_or("expected at least one element")?,
+            )),
         })),
         "texture" => Ok(Some(NamedParameter {
             name: String::from(name),
-            value: ParameterValue::Texture(parse_vector::<String>(tokenizer)?.first()
-                .ok_or("expected at least one element")?.clone()),
+            value: ParameterValue::Texture(
+                parse_vector::<String>(tokenizer)?
+                    .first()
+                    .ok_or("expected at least one element")?
+                    .clone(),
+            ),
         })),
         _ => Err(format!("invalid parameter type: {}", param_type)),
     }
@@ -1925,7 +1932,7 @@ pub fn parse_directive(
             let _ = expect_string(tokenizer)?;
 
             Ok(Some(Directive::Unimplemented("MediumInterface")))
-        },
+        }
         "MakeNamedMedium" => {
             let _ = expect_string(tokenizer)?;
             let _ = parse_parameter_list(tokenizer)?;
@@ -2160,8 +2167,9 @@ fn create_triangle_mesh(
 
             let mut converted = Vec::with_capacity(indices.len());
             for &index in indices {
-                let index = usize::try_from(index)
-                    .map_err(|_| format!("trianglemesh contains a negative vertex index: {}", index))?;
+                let index = usize::try_from(index).map_err(|_| {
+                    format!("trianglemesh contains a negative vertex index: {}", index)
+                })?;
 
                 if index >= positions.len() {
                     return Err(format!(
@@ -2183,9 +2191,7 @@ fn create_triangle_mesh(
                 ));
             }
 
-            (0..positions.len())
-                .map(|index| index as u32)
-                .collect()
+            (0..positions.len()).map(|index| index as u32).collect()
         }
     };
 
@@ -2245,7 +2251,11 @@ fn create_ply_mesh(
         }
     }
 
-    log::info!("loaded {} vertices and {} faces.", vertices.len(), indices.len() / 3);
+    log::info!(
+        "loaded {} vertices and {} faces.",
+        vertices.len(),
+        indices.len() / 3
+    );
 
     Ok(Mesh { vertices, indices })
 }
@@ -2261,7 +2271,7 @@ fn create_scene_mesh(
             vertices,
             normals,
             tangents,
-            uvs
+            uvs,
         } => create_triangle_mesh(vertices, indices, normals, tangents, uvs, transform),
         Shape::PlyMesh { filename, .. } => create_ply_mesh(filename, working_directory, transform),
 
@@ -2285,7 +2295,8 @@ fn look_at(eye: glam::Vec3, look: glam::Vec3, up: glam::Vec3) -> glam::Mat4 {
         new_up.extend(0.0),
         direction.extend(0.0),
         eye.extend(1.0),
-    ).inverse()
+    )
+    .inverse()
 }
 
 impl ParseState {
@@ -2371,7 +2382,10 @@ impl ParseState {
                     scene.camera_fov = fov.to_radians();
                 }
                 unsupported => {
-                    log::warn!("unsupported camera type {:?}, using perspective defaults", unsupported);
+                    log::warn!(
+                        "unsupported camera type {:?}, using perspective defaults",
+                        unsupported
+                    );
                 }
             },
 
@@ -2431,20 +2445,22 @@ impl ParseState {
                     self.working_directory.as_path(),
                     &match self.current_object.is_some() {
                         true => state.transformation.clone(),
-                        false => Transformation::default()
+                        false => Transformation::default(),
                     },
                 )?;
 
                 if mesh.vertices.len() > 0 {
                     match &mut self.current_object {
                         Some(object) => object.meshes.push(mesh),
-                        None => _ = {
-                            let id = scene.add_object(SceneObject { meshes: vec![mesh] });
-                            scene.add_object_instance(ObjectInstance {
-                                object: id,
-                                transform: state.transformation.matrix.clone(),
-                            })
-                        },
+                        None => {
+                            _ = {
+                                let id = scene.add_object(SceneObject { meshes: vec![mesh] });
+                                scene.add_object_instance(ObjectInstance {
+                                    object: id,
+                                    transform: state.transformation.matrix.clone(),
+                                })
+                            }
+                        }
                     }
                 } else {
                     log::warn!("empty object");

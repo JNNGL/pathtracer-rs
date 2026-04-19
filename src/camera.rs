@@ -24,13 +24,18 @@ fn basis_from_angles(yaw: f32, pitch: f32, roll: f32) -> (Vec3, Vec3, Vec3) {
         yaw.cos() * pitch.cos(),
         pitch.sin(),
         yaw.sin() * pitch.cos(),
-    ).normalize();
+    )
+    .normalize();
 
     let base_right = forward.cross(Vec3::Y).normalize_or_zero();
     let base_up = base_right.cross(forward).normalize_or_zero();
     let bank = Quat::from_axis_angle(forward, roll);
 
-    (forward, (bank * base_right).normalize_or_zero(), (bank * base_up).normalize_or_zero())
+    (
+        forward,
+        (bank * base_right).normalize_or_zero(),
+        (bank * base_up).normalize_or_zero(),
+    )
 }
 
 fn extract_angles(transform: Mat4) -> (f32, f32, f32) {
