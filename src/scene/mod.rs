@@ -24,7 +24,7 @@ pub enum MaterialType {
 
 #[repr(C)]
 #[derive(Default, Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct CompactedMaterial {
+pub struct CompactedMaterialPart {
     pub material_flags: u32,
     pub displacement: i32,
     pub normal_map: i32,
@@ -33,6 +33,14 @@ pub struct CompactedMaterial {
     pub reflectance: i32,
     pub eta: i32,
     pub k: i32,
+}
+
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CompactedMaterial {
+    pub material1: CompactedMaterialPart,
+    pub material2: CompactedMaterialPart,
+    pub mix_factor: i32,
 }
 
 pub struct ObjectInstance {
@@ -62,7 +70,7 @@ impl Scene {
 
     pub fn add_texture(&mut self, texture: image::DynamicImage) -> usize {
         self.textures.push(texture);
-        self.textures.len() - 1
+        self.textures.len()
     }
 
     pub fn add_object(&mut self, object: SceneObject) -> usize {

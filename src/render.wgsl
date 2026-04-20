@@ -39,6 +39,9 @@ var<storage, read> index_buffer: array<u32>;
 @group(1) @binding(3)
 var<storage, read> instance_buffer: array<InstanceData>;
 
+@group(1) @binding(4)
+var texture_array: binding_array<texture_2d<f32>>;
+
 struct RNGState {
     seed: vec3f,
 }

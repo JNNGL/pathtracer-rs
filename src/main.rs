@@ -5,6 +5,7 @@ pub mod scene;
 use crate::scene::MeshVertex;
 use std::sync::Arc;
 use std::time::Instant;
+use image::EncodableLayout;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -17,6 +18,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 struct InstanceData {
     first_index: u32,
     first_vertex: u32,
+    // material: scene::CompactedMaterial,
 }
 
 struct SceneData {
@@ -127,11 +129,16 @@ impl State {
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY
-                    | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                    | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                    | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+                    | wgpu::Features::TEXTURE_BINDING_ARRAY
+                    | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY
+                    | wgpu::Features::FLOAT32_FILTERABLE,
                 experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
                 required_limits: wgpu::Limits {
                     max_buffer_size: 1 << 32,
                     max_storage_buffer_binding_size: 1 << 32,
+                    max_binding_array_elements_per_shader_stage: 4096,
                     ..wgpu::Limits::default()
                 }
                 .using_minimum_supported_acceleration_structure_values(),
@@ -213,9 +220,7 @@ impl State {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage {
-                                read_only: true
-                            },
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -225,9 +230,7 @@ impl State {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage {
-                                read_only: true
-                            },
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -237,13 +240,21 @@ impl State {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage {
-                                read_only: true
-                            },
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
                         count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: std::num::NonZeroU32::new(4096),
                     }
                 ],
             });
@@ -419,7 +430,10 @@ impl State {
         let delta_time = now - self.last_update;
         self.last_update = now;
 
-        if self.camera_controller.update_camera(&mut self.camera, delta_time) {
+        if self
+            .camera_controller
+            .update_camera(&mut self.camera, delta_time)
+        {
             self.camera.reset_frame();
         }
 
@@ -447,7 +461,10 @@ impl State {
     }
 
     fn handle_mouse_motion(&mut self, delta_x: f64, delta_y: f64) {
-        if self.camera_controller.process_mouse_motion(&mut self.camera, delta_x, delta_y) {
+        if self
+            .camera_controller
+            .process_mouse_motion(&mut self.camera, delta_x, delta_y)
+        {
             self.camera.reset_frame();
         }
     }
@@ -488,6 +505,57 @@ impl State {
         self.camera.set_fov(scene.camera_fov);
         self.last_update = Instant::now();
 
+        let mut textures: Vec<wgpu::TextureView> = Vec::with_capacity(scene.textures.len());
+
+        for texture_data in &scene.textures {
+            let texture = self.device.create_texture(
+                &wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: texture_data.width(),
+                        height: texture_data.height(),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[]
+                }
+            );
+
+            let pixel_data = texture_data.to_rgba32f();
+
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixel_data.as_bytes(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(16 * texture_data.width()),
+                    rows_per_image: Some(texture_data.height()),
+                },
+                wgpu::Extent3d {
+                    width: texture_data.width(),
+                    height: texture_data.height(),
+                    depth_or_array_layers: 1,
+                }
+            );
+
+            self.queue.submit([]);
+            self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            textures.push(view);
+        }
+
+        log::info!("loaded {} textures", textures.len());
+
         log::info!("creating acceleration structures...");
 
         let mut mesh_build_inputs: Vec<Vec<_>> = Vec::new();
@@ -505,14 +573,18 @@ impl State {
         let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (total_indices * size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT,
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::BLAS_INPUT,
             mapped_at_creation: false,
         });
 
         let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (total_vertices * size_of::<MeshVertex>()) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT,
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::BLAS_INPUT,
             mapped_at_creation: false,
         });
 
@@ -531,8 +603,16 @@ impl State {
                     flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
                 };
 
-                self.queue.write_buffer(&index_buffer, (total_indices * size_of::<u32>()) as u64, bytemuck::cast_slice(&mesh.indices));
-                self.queue.write_buffer(&vertex_buffer, (total_vertices * size_of::<MeshVertex>()) as u64, bytemuck::cast_slice(&mesh.vertices));
+                self.queue.write_buffer(
+                    &index_buffer,
+                    (total_indices * size_of::<u32>()) as u64,
+                    bytemuck::cast_slice(&mesh.indices),
+                );
+                self.queue.write_buffer(
+                    &vertex_buffer,
+                    (total_vertices * size_of::<MeshVertex>()) as u64,
+                    bytemuck::cast_slice(&mesh.vertices),
+                );
 
                 let blas = self.device.create_blas(
                     &wgpu::CreateBlasDescriptor {
@@ -546,7 +626,8 @@ impl State {
                 );
 
                 object_inputs.push(MeshBuildInput {
-                    size, blas,
+                    size,
+                    blas,
                     vertex_offset: total_vertices,
                     index_offset: total_indices,
                 });
@@ -558,7 +639,11 @@ impl State {
             mesh_build_inputs.push(object_inputs);
         }
 
-        log::info!("loaded {} vertices and {} faces", total_vertices, total_indices / 3);
+        log::info!(
+            "loaded {} vertices and {} faces",
+            total_vertices,
+            total_indices / 3
+        );
 
         let tlas_instances = scene
             .instances
@@ -573,11 +658,12 @@ impl State {
             max_instances: tlas_instances as u32,
         });
 
-
         let instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (tlas_instances * size_of::<InstanceData>()) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT,
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::BLAS_INPUT,
             mapped_at_creation: false,
         });
 
@@ -589,7 +675,11 @@ impl State {
                     first_index: build_input.index_offset as u32,
                 };
 
-                self.queue.write_buffer(&instance_buffer, (store_index * size_of::<InstanceData>()) as u64, bytemuck::bytes_of(&instance_data));
+                self.queue.write_buffer(
+                    &instance_buffer,
+                    (store_index * size_of::<InstanceData>()) as u64,
+                    bytemuck::bytes_of(&instance_data),
+                );
 
                 tlas[store_index] = Some(wgpu::TlasInstance::new(
                     &build_input.blas,
@@ -663,6 +753,10 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: instance_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureViewArray(&textures.iter().collect::<Vec<_>>()),
                 }
             ],
         });

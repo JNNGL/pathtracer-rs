@@ -2302,21 +2302,216 @@ fn look_at(eye: glam::Vec3, look: glam::Vec3, up: glam::Vec3) -> glam::Mat4 {
     .inverse()
 }
 
-impl ParseState {
-    fn default_material(&mut self, scene: &mut Scene) -> Result<CompactedMaterial, String> {
-        Ok(CompactedMaterial {
-            material_flags: MaterialType::DIFFUSE as u32,
-            displacement: -1,
-            normal_map: -1,
-            roughness_u: -1,
-            roughness_v: -1,
-            reflectance: self.resolve_texture_ref(Some(&TextureRef::Float(0.8)), scene)?,
-            eta: -1,
-            k: -1,
-        })
+fn is_exr_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exr"))
+}
+
+fn canonical_exr_channel_name(name: &str) -> String {
+    name.rsplit(['.', '/'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+}
+
+fn select_exr_channel_indices<S: AsRef<str>>(channel_names: &[S]) -> [usize; 3] {
+    let canonical_names: Vec<_> = channel_names
+        .iter()
+        .map(|name| canonical_exr_channel_name(name.as_ref()))
+        .collect();
+
+    let find = |aliases: &[&str]| {
+        canonical_names
+            .iter()
+            .position(|name| aliases.iter().any(|alias| name == alias))
+    };
+
+    if let (Some(r), Some(g), Some(b)) = (
+        find(&["r", "red"]),
+        find(&["g", "green"]),
+        find(&["b", "blue"]),
+    ) {
+        return [r, g, b];
     }
 
-    fn resolve_constant_float_texture(&mut self, value: f32, scene: &mut Scene) -> Result<i32, String> {
+    if let (Some(r), Some(g), Some(b)) = (find(&["x"]), find(&["y"]), find(&["z"])) {
+        return [r, g, b];
+    }
+
+    if let Some(luma) = find(&[
+        "y",
+        "l",
+        "v",
+        "value",
+        "gray",
+        "grey",
+        "luma",
+        "luminance",
+        "depth",
+        "z",
+    ]) {
+        return [luma, luma, luma];
+    }
+
+    let fallback = canonical_names
+        .iter()
+        .position(|name| name != "a" && name != "alpha")
+        .unwrap_or(0);
+
+    [fallback, fallback, fallback]
+}
+
+fn load_exr_texture(path: &Path) -> Result<image::DynamicImage, String> {
+    let image = exr::prelude::read_first_flat_layer_from_file(path)
+        .map_err(|error| format!("Format error decoding OpenExr: {error}"))?;
+
+    let layer = image.layer_data;
+    let width = layer.size.width();
+    let height = layer.size.height();
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "EXR image dimensions overflow".to_string())?;
+
+    if layer.channel_data.list.is_empty() {
+        return Err("EXR image does not contain any flat channels".to_string());
+    }
+
+    let channel_names: Vec<_> = layer
+        .channel_data
+        .list
+        .iter()
+        .map(|channel| channel.name.to_string())
+        .collect();
+    let [r_index, g_index, b_index] = select_exr_channel_indices(&channel_names);
+    let channels = &layer.channel_data.list;
+
+    for &channel_index in &[r_index, g_index, b_index] {
+        let channel = &channels[channel_index];
+        if channel.sampling != exr::math::Vec2(1usize, 1usize) {
+            return Err(format!(
+                "unsupported EXR channel `{}` with subsampling {:?}",
+                channel.name, channel.sampling
+            ));
+        }
+
+        if channel.sample_data.len() != pixel_count {
+            return Err(format!(
+                "EXR channel `{}` has {} samples, expected {}",
+                channel.name,
+                channel.sample_data.len(),
+                pixel_count
+            ));
+        }
+    }
+
+    let mut pixels = Vec::with_capacity(pixel_count * 3);
+    for sample_index in 0..pixel_count {
+        pixels.push(
+            channels[r_index]
+                .sample_data
+                .value_by_flat_index(sample_index)
+                .to_f32(),
+        );
+        pixels.push(
+            channels[g_index]
+                .sample_data
+                .value_by_flat_index(sample_index)
+                .to_f32(),
+        );
+        pixels.push(
+            channels[b_index]
+                .sample_data
+                .value_by_flat_index(sample_index)
+                .to_f32(),
+        );
+    }
+
+    let width = u32::try_from(width).map_err(|_| "EXR image width exceeds u32".to_string())?;
+    let height = u32::try_from(height).map_err(|_| "EXR image height exceeds u32".to_string())?;
+    let image = image::Rgb32FImage::from_raw(width, height, pixels)
+        .ok_or_else(|| "failed to create RGB32F image from EXR samples".to_string())?;
+
+    Ok(image::DynamicImage::ImageRgb32F(image))
+}
+
+fn load_texture_image(path: &Path) -> Result<image::DynamicImage, String> {
+    if is_exr_path(path) {
+        load_exr_texture(path)
+    } else {
+        let reader = image::ImageReader::open(path)
+            .map_err(|error| format!("error opening texture: {}", error))?;
+        reader
+            .decode()
+            .map_err(|error| format!("error reading texture: {}", error))
+    }
+}
+
+fn output_texture_dimensions(textures: &[&image::Rgb32FImage]) -> (u32, u32) {
+    let width = textures
+        .iter()
+        .map(|texture| texture.width())
+        .max()
+        .unwrap_or(1);
+    let height = textures
+        .iter()
+        .map(|texture| texture.height())
+        .max()
+        .unwrap_or(1);
+
+    (width.max(1), height.max(1))
+}
+
+fn sample_texture_pixel(
+    texture: &image::Rgb32FImage,
+    x: u32,
+    y: u32,
+    output_width: u32,
+    output_height: u32,
+) -> glam::Vec3 {
+    let sample_x = if texture.width() == output_width {
+        x
+    } else {
+        (((x as f32 + 0.5) * texture.width() as f32 / output_width as f32).floor() as u32)
+            .min(texture.width().saturating_sub(1))
+    };
+
+    let sample_y = if texture.height() == output_height {
+        y
+    } else {
+        (((y as f32 + 0.5) * texture.height() as f32 / output_height as f32).floor() as u32)
+            .min(texture.height().saturating_sub(1))
+    };
+
+    let pixel = texture.get_pixel(sample_x, sample_y).0;
+    glam::vec3(pixel[0], pixel[1], pixel[2])
+}
+
+impl ParseState {
+    const DEFAULT_MATERIAL: CompactedMaterial = {
+        let material = CompactedMaterialPart {
+            material_flags: MaterialType::DIFFUSE as u32,
+            displacement: 0,
+            normal_map: 0,
+            roughness_u: 0,
+            roughness_v: 0,
+            reflectance: 0,
+            eta: 0,
+            k: 0,
+        };
+
+        CompactedMaterial {
+            material1: material,
+            material2: material,
+            mix_factor: 0,
+        }
+    };
+
+    fn resolve_constant_float_texture(
+        &mut self,
+        value: f32,
+        scene: &mut Scene,
+    ) -> Result<i32, String> {
         let key = format!("<proc:const-float:{}>", value);
         match self.textures.get(&key) {
             Some(texture) => Ok(*texture as i32),
@@ -2334,11 +2529,19 @@ impl ParseState {
         }
     }
 
-    fn resolve_constant_spectrum_texture(&mut self, value: &Spectrum, scene: &mut Scene) -> Result<i32, String> {
+    fn resolve_constant_spectrum_texture(
+        &mut self,
+        _value: &Spectrum,
+        _scene: &mut Scene,
+    ) -> Result<i32, String> {
         todo!()
     }
 
-    fn resolve_constant_rgb_texture(&mut self, value: &glam::Vec3, scene: &mut Scene) -> Result<i32, String> {
+    fn resolve_constant_rgb_texture(
+        &mut self,
+        value: &glam::Vec3,
+        scene: &mut Scene,
+    ) -> Result<i32, String> {
         let key = format!("<proc:const-rgb:{}>", value);
         match self.textures.get(&key) {
             Some(texture) => Ok(*texture as i32),
@@ -2356,46 +2559,142 @@ impl ParseState {
         }
     }
 
-    fn resolve_texture_ref(&mut self, texture: Option<&TextureRef>, scene: &mut Scene) -> Result<i32, String> {
+    fn texture_image<'a>(
+        &self,
+        texture: i32,
+        scene: &'a Scene,
+    ) -> Result<&'a image::DynamicImage, String> {
+        let index = usize::try_from(texture)
+            .ok()
+            .and_then(|texture| texture.checked_sub(1))
+            .ok_or_else(|| format!("texture index {} is invalid", texture))?;
+
+        scene
+            .textures
+            .get(index)
+            .ok_or_else(|| format!("texture index {} is out of bounds", texture))
+    }
+
+    fn resolve_texture_image(
+        &mut self,
+        texture: &TextureRef,
+        scene: &mut Scene,
+    ) -> Result<image::Rgb32FImage, String> {
+        let texture = self.resolve_texture_ref(Some(texture), scene)?;
+        Ok(self.texture_image(texture, scene)?.to_rgb32f())
+    }
+
+    fn create_generated_texture(&mut self, scene: &mut Scene, image: image::Rgb32FImage) -> i32 {
+        scene.add_texture(image::DynamicImage::ImageRgb32F(image)) as i32
+    }
+
+    fn resolve_mix_texture(
+        &mut self,
+        texture1: &TextureRef,
+        texture2: &TextureRef,
+        amount: &TextureRef,
+        scene: &mut Scene,
+    ) -> Result<i32, String> {
+        let texture1 = self.resolve_texture_image(texture1, scene)?;
+        let texture2 = self.resolve_texture_image(texture2, scene)?;
+        let amount = self.resolve_texture_image(amount, scene)?;
+
+        let (width, height) = output_texture_dimensions(&[&texture1, &texture2, &amount]);
+        let mut image = image::Rgb32FImage::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let texture1 = sample_texture_pixel(&texture1, x, y, width, height);
+                let texture2 = sample_texture_pixel(&texture2, x, y, width, height);
+                let amount = sample_texture_pixel(&amount, x, y, width, height);
+
+                let pixel = texture1 * (glam::Vec3::ONE - amount) + texture2 * amount;
+                image.put_pixel(x, y, image::Rgb(pixel.to_array()));
+            }
+        }
+
+        Ok(self.create_generated_texture(scene, image))
+    }
+
+    fn resolve_scaled_texture(
+        &mut self,
+        texture: &TextureRef,
+        scale: &TextureRef,
+        scene: &mut Scene,
+    ) -> Result<i32, String> {
+        let texture = self.resolve_texture_image(texture, scene)?;
+        let scale = self.resolve_texture_image(scale, scene)?;
+
+        let (width, height) = output_texture_dimensions(&[&texture, &scale]);
+        let mut image = image::Rgb32FImage::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let texture = sample_texture_pixel(&texture, x, y, width, height);
+                let scale = sample_texture_pixel(&scale, x, y, width, height);
+
+                image.put_pixel(x, y, image::Rgb((texture * scale).to_array()));
+            }
+        }
+
+        Ok(self.create_generated_texture(scene, image))
+    }
+
+    fn resolve_texture_ref(
+        &mut self,
+        texture: Option<&TextureRef>,
+        scene: &mut Scene,
+    ) -> Result<i32, String> {
         match texture {
             Some(texture) => match texture {
-                TextureRef::Named(name) => Ok(*self.textures.get(name)
-                    .ok_or_else(|| format!("couldn't find texture: `{}`", name))? as i32),
+                TextureRef::Named(name) => Ok(*self
+                    .textures
+                    .get(name)
+                    .ok_or_else(|| format!("couldn't find texture: `{}`", name))?
+                    as i32),
                 TextureRef::Float(value) => self.resolve_constant_float_texture(*value, scene),
-                TextureRef::Spectrum(spectrum) => self.resolve_constant_spectrum_texture(spectrum, scene),
+                TextureRef::Spectrum(spectrum) => {
+                    self.resolve_constant_spectrum_texture(spectrum, scene)
+                }
                 TextureRef::RGB(rgb) => self.resolve_constant_rgb_texture(rgb, scene),
             },
-            None => Ok(-1)
+            None => Ok(0),
         }
     }
 
     fn resolve_texture(&mut self, texture: &Texture, scene: &mut Scene) -> Result<i32, String> {
         match texture {
-            Texture::Constant {
-                value
-            } => self.resolve_texture_ref(Some(value), scene),
-            Texture::ImageMap {
-                filename,
-                ..
-            } => self.resolve_texture_from_file(Some(filename), scene),
+            Texture::Constant { value } => self.resolve_texture_ref(Some(value), scene),
+            Texture::ImageMap { filename, .. } => {
+                self.resolve_texture_from_file(Some(filename), scene)
+            }
+            Texture::Mix {
+                texture1,
+                texture2,
+                amount,
+            } => self.resolve_mix_texture(texture1, texture2, amount, scene),
+            Texture::Scale { texture, scale } => self.resolve_scaled_texture(texture, scale, scene),
             _ => {
                 log::warn!("unsupported texture type: {}", texture);
-                Ok(-1)
+                Ok(0)
             }
         }
     }
 
-    fn resolve_texture_from_file(&mut self, file: Option<&String>, scene: &mut Scene) -> Result<i32, String> {
+    fn resolve_texture_from_file(
+        &mut self,
+        file: Option<&String>,
+        scene: &mut Scene,
+    ) -> Result<i32, String> {
         match file {
             Some(file) => {
                 let key = format!("<proc:file:{}>", file);
                 match self.textures.get(&key) {
                     Some(texture) => Ok(*texture as i32),
                     None => {
-                        let reader = image::ImageReader::open(self.working_directory.join(file))
-                            .map_err(|e| format!("error opening `{}`: {}", file, e.to_string()))?;
-                        let image = reader.decode()
-                            .map_err(|e| format!("error reading `{}`: {}", file, e.to_string()))?;
+                        let path = self.working_directory.join(file);
+                        let image = load_texture_image(&path)
+                            .map_err(|error| format!("error reading `{}`: {}", file, error))?;
 
                         let index = scene.add_texture(image);
                         self.textures.insert(key, index);
@@ -2403,31 +2702,65 @@ impl ParseState {
                         Ok(index as i32)
                     }
                 }
-            },
-            None => Ok(-1)
+            }
+            None => Ok(0),
         }
     }
 
-    fn resolve_material(&mut self, material: &Material, scene: &mut Scene) -> Result<CompactedMaterial, String> {
+    fn resolve_material(
+        &mut self,
+        material: &Material,
+        scene: &mut Scene,
+    ) -> Result<CompactedMaterial, String> {
         match material {
             Material::Diffuse {
                 normal,
                 reflectance,
             } => {
-                Ok(CompactedMaterial {
+                let material = CompactedMaterialPart {
                     material_flags: MaterialType::DIFFUSE as u32,
                     displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
-                    normal_map: self.resolve_texture_from_file(normal.normal_map.as_ref(), scene)?,
-                    roughness_u: -1,
-                    roughness_v: -1,
+                    normal_map: self
+                        .resolve_texture_from_file(normal.normal_map.as_ref(), scene)?,
+                    roughness_u: 0,
+                    roughness_v: 0,
                     reflectance: self.resolve_texture_ref(Some(reflectance), scene)?,
-                    eta: -1,
-                    k: -1,
+                    eta: 0,
+                    k: 0,
+                };
+
+                Ok(CompactedMaterial {
+                    material1: material,
+                    material2: material,
+                    mix_factor: 0,
+                })
+            }
+            Material::Mix { materials, amount } => {
+                let material1 = *self
+                    .materials
+                    .get(&materials[0])
+                    .ok_or_else(|| format!("couldn't find material: `{}`", materials[0]))?;
+                let material2 = *self
+                    .materials
+                    .get(&materials[1])
+                    .ok_or_else(|| format!("couldn't find material: `{}`", materials[0]))?;
+
+                let part1 = material1.material1;
+                let part2 = material2.material1;
+
+                if material1.mix_factor != 0 || material2.mix_factor != 0 {
+                    log::warn!("nested material mix");
+                }
+
+                Ok(CompactedMaterial {
+                    material1: part1,
+                    material2: part2,
+                    mix_factor: self.resolve_texture_ref(Some(amount), scene)?,
                 })
             }
             unsupported => {
                 log::warn!("unsupported material: {}", unsupported);
-                self.default_material(scene)
+                Ok(Self::DEFAULT_MATERIAL)
             }
         }
     }
@@ -2616,23 +2949,24 @@ impl ParseState {
                 self.textures.insert(name, texture as usize);
             }
 
-            Directive::MakeNamedMaterial {
-                name,
-                material,
-            } => {
+            Directive::MakeNamedMaterial { name, material } => {
                 let material = self.resolve_material(&material, scene)?;
                 self.materials.insert(name, material);
             }
-            Directive::NamedMaterial {
-                name,
-            } => {
-                state.current_material = self.materials.get(&name)
-                    .ok_or_else(|| format!("couldn't find material: {}", name))?.clone();
+            Directive::NamedMaterial { name } => {
+                state.current_material =
+                    self.materials
+                        .get(&name)
+                        .map(Clone::clone)
+                        .unwrap_or_else(|| {
+                            log::warn!("couldn't find material: `{}`", name);
+                            Self::DEFAULT_MATERIAL
+                        })
             }
             Directive::Material(material) => {
                 let material = self.resolve_material(&material, scene)?;
                 self.graphics_state.last_mut().unwrap().current_material = material;
-            },
+            }
 
             _ => {
                 log::warn!("unhandled directive: {:?}", directive);
@@ -2643,7 +2977,7 @@ impl ParseState {
     }
 
     fn parse_into(&mut self, scene: &mut Scene, tokenizer: &mut Tokenizer) -> Result<(), String> {
-        self.graphics_state.last_mut().unwrap().current_material = self.default_material(scene)?;
+        self.graphics_state.last_mut().unwrap().current_material = Self::DEFAULT_MATERIAL;
 
         let result = loop {
             let directive = match parse_directive(self.graphics_state.last().unwrap(), tokenizer) {

@@ -16,3 +16,4 @@ bytemuck = "1.25"
 strum = { version = "0.28", features = ["derive"] }
 ply-rs = "0.1"
 image = "0.25"
+exr = "1.74"
