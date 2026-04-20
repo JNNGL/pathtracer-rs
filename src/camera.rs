@@ -13,10 +13,9 @@ pub struct Camera {
     roll: f32,
     aspect_ratio: f32,
     fovy_radians: f32,
-    aperture: f32,
-    focus_distance: f32,
     z_near: f32,
     z_far: f32,
+    frame_index: u32,
 }
 
 fn basis_from_angles(yaw: f32, pitch: f32, roll: f32) -> (Vec3, Vec3, Vec3) {
@@ -83,11 +82,18 @@ impl Camera {
             roll,
             aspect_ratio,
             fovy_radians: 45.0f32.to_radians(),
-            aperture: 0.0,
-            focus_distance: 1.0,
             z_near: 0.05,
             z_far: 1024.0,
+            frame_index: 0,
         }
+    }
+
+    pub fn reset_frame(&mut self) {
+        self.frame_index = 0;
+    }
+
+    pub fn update_frame(&mut self) {
+        self.frame_index += 1;
     }
 
     pub fn from_transform(transform: Mat4, aspect_ratio: f32) -> Self {
@@ -161,6 +167,7 @@ impl Camera {
         CameraUniform {
             view_inverse: self.camera_to_world_matrix(),
             projection_inverse: self.projection_matrix().inverse(),
+            frame_index: [self.frame_index, 0, 0, 0],
         }
     }
 }
@@ -284,4 +291,5 @@ impl CameraController {
 pub struct CameraUniform {
     pub view_inverse: Mat4,
     pub projection_inverse: Mat4,
+    pub frame_index: [u32; 4],
 }

@@ -257,7 +257,7 @@ pub struct Coating {
     pub thickness: TextureRef,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::Display)]
 pub enum Material {
     CoatedDiffuse {
         normal: BumpNormalMap,
@@ -382,7 +382,7 @@ pub enum TextureWrap {
     Clamp,
 }
 
-#[derive(Debug)]
+#[derive(Debug, strum::Display)]
 pub enum Texture {
     BilinearInterpolation {
         v00: TextureRef,
@@ -550,18 +550,15 @@ pub enum Directive {
         scale: f32,
     },
     AreaLightSource(AreaLightSource), // TODO
-    Material(Material),               // TODO
+    Material(Material),
     MakeNamedMaterial {
-        // TODO
         name: String,
         material: Material,
     },
     NamedMaterial {
-        // TODO
         name: String,
     },
     Texture {
-        // TODO
         name: String,
         texture_type: TextureType,
         texture: Texture,
@@ -1955,7 +1952,7 @@ pub struct GraphicsState {
     pub material_attributes: ParameterDictionary,
     pub medium_attributes: ParameterDictionary,
     pub texture_attributes: ParameterDictionary,
-    pub current_material: Material,
+    pub current_material: CompactedMaterial,
     pub color_space: ColorSpace,
     pub transformation: Transformation,
     pub area_light: Option<AreaLightSource>,
@@ -1970,6 +1967,8 @@ pub struct ParseState {
     pub objects: HashMap<String, usize>,
     pub current_object: Option<SceneObject>,
     pub current_object_name: Option<String>,
+    pub textures: HashMap<String, usize>,
+    pub materials: HashMap<String, CompactedMaterial>,
 }
 
 impl Default for ParseState {
@@ -1981,6 +1980,8 @@ impl Default for ParseState {
             objects: HashMap::new(),
             current_object: None,
             current_object_name: None,
+            textures: HashMap::new(),
+            materials: HashMap::new(),
         }
     }
 }
@@ -2152,7 +2153,8 @@ fn create_triangle_mesh(
     let vertices = positions
         .iter()
         .map(|position| MeshVertex {
-            position: transform.matrix.transform_point3(*position),
+            position_u: transform.matrix.transform_point3(*position).extend(0.0),
+            normal_v: glam::Vec4::ZERO,
         })
         .collect();
 
@@ -2233,7 +2235,8 @@ fn create_ply_mesh(
         );
 
         vertices.push(MeshVertex {
-            position: transform.matrix.transform_point3(position),
+            position_u: transform.matrix.transform_point3(position).extend(0.0),
+            normal_v: glam::Vec4::ZERO,
         });
     }
 
@@ -2300,6 +2303,135 @@ fn look_at(eye: glam::Vec3, look: glam::Vec3, up: glam::Vec3) -> glam::Mat4 {
 }
 
 impl ParseState {
+    fn default_material(&mut self, scene: &mut Scene) -> Result<CompactedMaterial, String> {
+        Ok(CompactedMaterial {
+            material_flags: MaterialType::DIFFUSE as u32,
+            displacement: -1,
+            normal_map: -1,
+            roughness_u: -1,
+            roughness_v: -1,
+            reflectance: self.resolve_texture_ref(Some(&TextureRef::Float(0.8)), scene)?,
+            eta: -1,
+            k: -1,
+        })
+    }
+
+    fn resolve_constant_float_texture(&mut self, value: f32, scene: &mut Scene) -> Result<i32, String> {
+        let key = format!("<proc:const-float:{}>", value);
+        match self.textures.get(&key) {
+            Some(texture) => Ok(*texture as i32),
+            None => {
+                let mut image = image::Rgb32FImage::new(1, 1);
+                image.put_pixel(0, 0, image::Rgb([value, value, value]));
+
+                let image = image::DynamicImage::ImageRgb32F(image);
+
+                let index = scene.add_texture(image);
+                self.textures.insert(key, index);
+
+                Ok(index as i32)
+            }
+        }
+    }
+
+    fn resolve_constant_spectrum_texture(&mut self, value: &Spectrum, scene: &mut Scene) -> Result<i32, String> {
+        todo!()
+    }
+
+    fn resolve_constant_rgb_texture(&mut self, value: &glam::Vec3, scene: &mut Scene) -> Result<i32, String> {
+        let key = format!("<proc:const-rgb:{}>", value);
+        match self.textures.get(&key) {
+            Some(texture) => Ok(*texture as i32),
+            None => {
+                let mut image = image::Rgb32FImage::new(1, 1);
+                image.put_pixel(0, 0, image::Rgb(value.to_array()));
+
+                let image = image::DynamicImage::ImageRgb32F(image);
+
+                let index = scene.add_texture(image);
+                self.textures.insert(key, index);
+
+                Ok(index as i32)
+            }
+        }
+    }
+
+    fn resolve_texture_ref(&mut self, texture: Option<&TextureRef>, scene: &mut Scene) -> Result<i32, String> {
+        match texture {
+            Some(texture) => match texture {
+                TextureRef::Named(name) => Ok(*self.textures.get(name)
+                    .ok_or_else(|| format!("couldn't find texture: `{}`", name))? as i32),
+                TextureRef::Float(value) => self.resolve_constant_float_texture(*value, scene),
+                TextureRef::Spectrum(spectrum) => self.resolve_constant_spectrum_texture(spectrum, scene),
+                TextureRef::RGB(rgb) => self.resolve_constant_rgb_texture(rgb, scene),
+            },
+            None => Ok(-1)
+        }
+    }
+
+    fn resolve_texture(&mut self, texture: &Texture, scene: &mut Scene) -> Result<i32, String> {
+        match texture {
+            Texture::Constant {
+                value
+            } => self.resolve_texture_ref(Some(value), scene),
+            Texture::ImageMap {
+                filename,
+                ..
+            } => self.resolve_texture_from_file(Some(filename), scene),
+            _ => {
+                log::warn!("unsupported texture type: {}", texture);
+                Ok(-1)
+            }
+        }
+    }
+
+    fn resolve_texture_from_file(&mut self, file: Option<&String>, scene: &mut Scene) -> Result<i32, String> {
+        match file {
+            Some(file) => {
+                let key = format!("<proc:file:{}>", file);
+                match self.textures.get(&key) {
+                    Some(texture) => Ok(*texture as i32),
+                    None => {
+                        let reader = image::ImageReader::open(self.working_directory.join(file))
+                            .map_err(|e| format!("error opening `{}`: {}", file, e.to_string()))?;
+                        let image = reader.decode()
+                            .map_err(|e| format!("error reading `{}`: {}", file, e.to_string()))?;
+
+                        let index = scene.add_texture(image);
+                        self.textures.insert(key, index);
+
+                        Ok(index as i32)
+                    }
+                }
+            },
+            None => Ok(-1)
+        }
+    }
+
+    fn resolve_material(&mut self, material: &Material, scene: &mut Scene) -> Result<CompactedMaterial, String> {
+        match material {
+            Material::Diffuse {
+                normal,
+                reflectance,
+            } => {
+                Ok(CompactedMaterial {
+                    material_flags: MaterialType::DIFFUSE as u32,
+                    displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
+                    normal_map: self.resolve_texture_from_file(normal.normal_map.as_ref(), scene)?,
+                    roughness_u: -1,
+                    roughness_v: -1,
+                    reflectance: self.resolve_texture_ref(Some(reflectance), scene)?,
+                    eta: -1,
+                    k: -1,
+                })
+            }
+            unsupported => {
+                log::warn!("unsupported material: {}", unsupported);
+                self.default_material(scene)
+            }
+        }
+    }
+
     pub fn apply_directive(
         self: &mut Self,
         scene: &mut Scene,
@@ -2436,6 +2568,7 @@ impl ParseState {
                 scene.add_object_instance(ObjectInstance {
                     object: index,
                     transform: state.transformation.matrix.clone(),
+                    material: state.current_material,
                 })
             }
 
@@ -2458,6 +2591,7 @@ impl ParseState {
                                 scene.add_object_instance(ObjectInstance {
                                     object: id,
                                     transform: state.transformation.matrix.clone(),
+                                    material: state.current_material,
                                 })
                             }
                         }
@@ -2466,6 +2600,39 @@ impl ParseState {
                     log::warn!("empty object");
                 }
             }
+
+            Directive::Texture {
+                name,
+                texture_type: _texture_type,
+                texture,
+                mapping,
+            } => {
+                match mapping {
+                    TextureMapping::Uv { .. } => {}
+                    _ => log::warn!("unsupported mapping type {:?}", mapping),
+                }
+
+                let texture = self.resolve_texture(&texture, scene)?;
+                self.textures.insert(name, texture as usize);
+            }
+
+            Directive::MakeNamedMaterial {
+                name,
+                material,
+            } => {
+                let material = self.resolve_material(&material, scene)?;
+                self.materials.insert(name, material);
+            }
+            Directive::NamedMaterial {
+                name,
+            } => {
+                state.current_material = self.materials.get(&name)
+                    .ok_or_else(|| format!("couldn't find material: {}", name))?.clone();
+            }
+            Directive::Material(material) => {
+                let material = self.resolve_material(&material, scene)?;
+                self.graphics_state.last_mut().unwrap().current_material = material;
+            },
 
             _ => {
                 log::warn!("unhandled directive: {:?}", directive);
@@ -2476,6 +2643,8 @@ impl ParseState {
     }
 
     fn parse_into(&mut self, scene: &mut Scene, tokenizer: &mut Tokenizer) -> Result<(), String> {
+        self.graphics_state.last_mut().unwrap().current_material = self.default_material(scene)?;
+
         let result = loop {
             let directive = match parse_directive(self.graphics_state.last().unwrap(), tokenizer) {
                 Ok(directive) => directive,
