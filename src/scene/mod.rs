@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec4};
+use glam::{Mat4, Vec4, Vec2};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -19,7 +19,23 @@ pub struct SceneObject {
 }
 
 pub enum MaterialType {
-    DIFFUSE = 1,
+    DIFFUSE = 0,
+    DIELECTRIC = 1,
+    CONDUCTOR = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SceneEnvironment {
+    pub light_map: i32,
+}
+
+impl Default for SceneEnvironment {
+    fn default() -> Self {
+        Self {
+            light_map: -1,
+        }
+    }
 }
 
 #[repr(C)]
@@ -49,12 +65,48 @@ pub struct ObjectInstance {
     pub material: CompactedMaterial,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ImageInfo {
+    pub uv_scale: Vec2,
+    pub uv_delta: Vec2,
+    pub scale: f32,
+    pub gamma: f32,
+    pub flags: u32,
+    pub pad: u32,
+}
+
+impl ImageInfo {
+    pub fn linear() -> Self {
+        Self {
+            uv_scale: Vec2::new(1.0, 1.0),
+            uv_delta: Vec2::ZERO,
+            scale: 1.0,
+            gamma: 1.0,
+            flags: 0,
+            pad: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Texture {
+    pub tex_type: u32,
+    pub tex0: u32,
+    pub tex1: u32,
+    pub tex2: u32,
+}
+
 pub struct Scene {
     pub objects: Vec<SceneObject>,
     pub instances: Vec<ObjectInstance>,
-    pub textures: Vec<image::DynamicImage>,
+    pub images: Vec<image::DynamicImage>,
+    pub image_infos: Vec<ImageInfo>,
+    pub textures: Vec<Texture>,
     pub camera_transformation: Mat4,
     pub camera_fov: f32,
+    pub environment: SceneEnvironment,
 }
 
 impl Scene {
@@ -62,15 +114,24 @@ impl Scene {
         Self {
             objects: Vec::new(),
             instances: Vec::new(),
+            images: Vec::new(),
+            image_infos: Vec::new(),
             textures: Vec::new(),
             camera_transformation: Mat4::IDENTITY,
             camera_fov: 45.0f32.to_radians(),
+            environment: SceneEnvironment::default(),
         }
     }
 
-    pub fn add_texture(&mut self, texture: image::DynamicImage) -> usize {
+    pub fn add_image(&mut self, image: image::DynamicImage, info: ImageInfo) -> usize {
+        self.images.push(image);
+        self.image_infos.push(info);
+        self.images.len() - 1
+    }
+
+    pub fn add_texture(&mut self, texture: Texture) -> usize {
         self.textures.push(texture);
-        self.textures.len()
+        self.textures.len() - 1
     }
 
     pub fn add_object(&mut self, object: SceneObject) -> usize {

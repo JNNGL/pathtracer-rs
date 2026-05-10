@@ -270,8 +270,8 @@ pub enum Material {
         interface_roughness: Roughness,
         conductor_roughness: Roughness,
         coating: Coating,
-        eta: Spectrum,
-        k: Spectrum,
+        eta: TextureRef,
+        k: TextureRef,
         reflectance: Option<TextureRef>,
     },
     Conductor {
@@ -1069,11 +1069,13 @@ fn parse_material(
             interface_roughness: parse_roughness!(state, parameters, "interface.")?,
             conductor_roughness: parse_roughness!(state, parameters, "conductor.")?,
             eta: parameters
-                .get_spectrum("conductor.eta", Some(&state.material_attributes))?
-                .unwrap_or_else(|| Spectrum::Named("metal-Cu-eta".to_string())),
+                .get_texture_ref("eta", Some(&state.material_attributes))?
+                .unwrap_or_else(|| {
+                    TextureRef::Spectrum(Spectrum::Named("metal-Cu-eta".to_string()))
+                }),
             k: parameters
-                .get_spectrum("conductor.k", Some(&state.material_attributes))?
-                .unwrap_or_else(|| Spectrum::Named("metal-Cu-k".to_string())),
+                .get_texture_ref("k", Some(&state.material_attributes))?
+                .unwrap_or_else(|| TextureRef::Spectrum(Spectrum::Named("metal-Cu-k".to_string()))),
             reflectance: parameters
                 .get_texture_ref("reflectance", Some(&state.material_attributes))?,
             coating: parse_coating(&state, &parameters)?,
@@ -1092,7 +1094,7 @@ fn parse_material(
             reflectance: parameters
                 .get_texture_ref("reflectance", Some(&state.material_attributes))?,
         }),
-        "dielectric" => Ok(Material::Dielectric {
+        "dielectric" | "thindielectric" => Ok(Material::Dielectric {
             normal: parse_bump_normal_map(&state, &parameters)?,
             roughness: parse_roughness!(state, parameters, "")?,
             eta: parameters
@@ -1561,9 +1563,7 @@ pub fn parse_directive(
                         tangents: parameters
                             .get_vectors3("S", Some(&state.shape_attributes))?
                             .map(|v| v.clone()),
-                        uvs: parameters
-                            .get_points2("uv", Some(&state.shape_attributes))?
-                            .map(|v| v.clone()),
+                        uvs: get_triangle_mesh_uvs(&parameters, Some(&state.shape_attributes))?,
                     },
                     "plymesh" => Shape::PlyMesh {
                         filename: parameters
@@ -1751,7 +1751,7 @@ pub fn parse_directive(
                             .get_vector3("v1", Some(&state.texture_attributes))?
                             .unwrap_or(glam::vec3(1.0, 0.0, 0.0)),
                         v2: parameters
-                            .get_vector3("v1", Some(&state.texture_attributes))?
+                            .get_vector3("v2", Some(&state.texture_attributes))?
                             .unwrap_or(glam::vec3(0.0, 1.0, 0.0)),
                     }),
                     _ => Err(format!("invalid texture mapping: `{}`", s)),
@@ -2019,6 +2019,63 @@ fn read_ply_vertex_component(
         })
 }
 
+fn read_optional_ply_vertex_component(
+    vertex: &DefaultElement,
+    property_names: &[&str],
+) -> Option<f32> {
+    property_names
+        .iter()
+        .find_map(|property_name| vertex.get(*property_name).and_then(read_ply_scalar))
+}
+
+fn read_optional_ply_vertex_vec3(
+    vertex: &DefaultElement,
+    x_names: &[&str],
+    y_names: &[&str],
+    z_names: &[&str],
+    label: &str,
+    vertex_index: usize,
+    path: &Path,
+) -> Result<Option<glam::Vec3>, String> {
+    let x = read_optional_ply_vertex_component(vertex, x_names);
+    let y = read_optional_ply_vertex_component(vertex, y_names);
+    let z = read_optional_ply_vertex_component(vertex, z_names);
+
+    match (x, y, z) {
+        (None, None, None) => Ok(None),
+        (Some(x), Some(y), Some(z)) => Ok(Some(glam::vec3(x, y, z))),
+        _ => Err(format!(
+            "PLY mesh {} has incomplete {} data for vertex {}",
+            path.display(),
+            label,
+            vertex_index
+        )),
+    }
+}
+
+fn read_optional_ply_vertex_vec2(
+    vertex: &DefaultElement,
+    x_names: &[&str],
+    y_names: &[&str],
+    label: &str,
+    vertex_index: usize,
+    path: &Path,
+) -> Result<Option<glam::Vec2>, String> {
+    let x = read_optional_ply_vertex_component(vertex, x_names);
+    let y = read_optional_ply_vertex_component(vertex, y_names);
+
+    match (x, y) {
+        (None, None) => Ok(None),
+        (Some(x), Some(y)) => Ok(Some(glam::vec2(x, y))),
+        _ => Err(format!(
+            "PLY mesh {} has incomplete {} data for vertex {}",
+            path.display(),
+            label,
+            vertex_index
+        )),
+    }
+}
+
 fn convert_ply_index_list<T>(
     values: &[T],
     path: &Path,
@@ -2104,6 +2161,75 @@ fn read_ply_face_indices(
     Ok(indices)
 }
 
+fn get_triangle_mesh_uvs(
+    parameters: &ParameterDictionary,
+    fallback: Option<&ParameterDictionary>,
+) -> Result<Option<Vec<glam::Vec2>>, String> {
+    for name in ["uv", "st"] {
+        let Some(parameter) = parameters.get(name, fallback) else {
+            continue;
+        };
+
+        return match &parameter.value {
+            ParameterValue::Point2(values) | ParameterValue::Vector2(values) => {
+                Ok(Some(values.clone()))
+            }
+            ParameterValue::Float(values) => {
+                if values.len() % 2 != 0 {
+                    Err(format!(
+                        "trianglemesh {} parameter must contain an even number of floats, got {}",
+                        name,
+                        values.len()
+                    ))
+                } else {
+                    Ok(Some(
+                        values
+                            .chunks_exact(2)
+                            .map(|chunk| glam::vec2(chunk[0], chunk[1]))
+                            .collect(),
+                    ))
+                }
+            }
+            _ => Err(format!("wrong parameter type: {}", parameter.value)),
+        };
+    }
+
+    Ok(None)
+}
+
+const MISSING_UV_COORD: f32 = -1.0;
+
+fn transform_mesh_normal(transform: &Transformation, normal: glam::Vec3) -> glam::Vec3 {
+    let transformed = transform
+        .matrix
+        .inverse()
+        .transpose()
+        .transform_vector3(normal);
+
+    if transformed.is_finite() {
+        transformed.normalize_or_zero()
+    } else {
+        glam::Vec3::ZERO
+    }
+}
+
+fn pack_mesh_vertex(
+    position: glam::Vec3,
+    normal: Option<glam::Vec3>,
+    uv: Option<glam::Vec2>,
+    transform: &Transformation,
+) -> MeshVertex {
+    let uv = uv.unwrap_or(glam::vec2(MISSING_UV_COORD, MISSING_UV_COORD));
+    let normal = normal
+        .map(|normal| transform_mesh_normal(transform, normal))
+        .unwrap_or(glam::Vec3::ZERO);
+
+    MeshVertex {
+        position_u: transform.matrix.transform_point3(position).extend(uv.x),
+        normal_v: normal.extend(uv.y),
+    }
+}
+
 fn create_triangle_mesh(
     positions: &[glam::Vec3],
     indices: &Option<Vec<i32>>,
@@ -2152,9 +2278,16 @@ fn create_triangle_mesh(
 
     let vertices = positions
         .iter()
-        .map(|position| MeshVertex {
-            position_u: transform.matrix.transform_point3(*position).extend(0.0),
-            normal_v: glam::Vec4::ZERO,
+        .enumerate()
+        .map(|(index, position)| {
+            pack_mesh_vertex(
+                *position,
+                normals
+                    .as_ref()
+                    .and_then(|normals| normals.get(index).copied()),
+                uvs.as_ref().and_then(|uvs| uvs.get(index).copied()),
+                transform,
+            )
         })
         .collect();
 
@@ -2226,6 +2359,8 @@ fn create_ply_mesh(
         .get("vertex")
         .ok_or_else(|| format!("ply mesh {} is missing a vertex element", path.display()))?;
     let mut vertices = Vec::with_capacity(vertex_elements.len());
+    let mut has_normals = None;
+    let mut has_uvs = None;
 
     for (vertex_index, vertex) in vertex_elements.iter().enumerate() {
         let position = glam::vec3(
@@ -2233,11 +2368,61 @@ fn create_ply_mesh(
             read_ply_vertex_component(vertex, "y", vertex_index, &path)?,
             read_ply_vertex_component(vertex, "z", vertex_index, &path)?,
         );
+        let normal = read_optional_ply_vertex_vec3(
+            vertex,
+            &["nx", "normal_x"],
+            &["ny", "normal_y"],
+            &["nz", "normal_z"],
+            "normal",
+            vertex_index,
+            &path,
+        )?;
+        let uv = read_optional_ply_vertex_vec2(
+            vertex,
+            &[
+                "u",
+                "s",
+                "texture_u",
+                "texture_s",
+                "texcoord_u",
+                "texcoord_s",
+            ],
+            &[
+                "v",
+                "t",
+                "texture_v",
+                "texture_t",
+                "texcoord_v",
+                "texcoord_t",
+            ],
+            "uv",
+            vertex_index,
+            &path,
+        )?;
 
-        vertices.push(MeshVertex {
-            position_u: transform.matrix.transform_point3(position).extend(0.0),
-            normal_v: glam::Vec4::ZERO,
-        });
+        match has_normals {
+            Some(expected) if expected != normal.is_some() => {
+                return Err(format!(
+                    "PLY mesh {} has inconsistent per-vertex normal data",
+                    path.display()
+                ));
+            }
+            None => has_normals = Some(normal.is_some()),
+            _ => {}
+        }
+
+        match has_uvs {
+            Some(expected) if expected != uv.is_some() => {
+                return Err(format!(
+                    "PLY mesh {} has inconsistent per-vertex uv data",
+                    path.display()
+                ));
+            }
+            None => has_uvs = Some(uv.is_some()),
+            _ => {}
+        }
+
+        vertices.push(pack_mesh_vertex(position, normal, uv, transform));
     }
 
     let face_elements = ply
@@ -2443,67 +2628,28 @@ fn load_texture_image(path: &Path) -> Result<image::DynamicImage, String> {
             .map_err(|error| format!("error opening texture: {}", error))?;
         reader
             .decode()
+            .map(|image| image::DynamicImage::ImageRgba8(image.into_rgba8()))
             .map_err(|error| format!("error reading texture: {}", error))
     }
-}
-
-fn output_texture_dimensions(textures: &[&image::Rgb32FImage]) -> (u32, u32) {
-    let width = textures
-        .iter()
-        .map(|texture| texture.width())
-        .max()
-        .unwrap_or(1);
-    let height = textures
-        .iter()
-        .map(|texture| texture.height())
-        .max()
-        .unwrap_or(1);
-
-    (width.max(1), height.max(1))
-}
-
-fn sample_texture_pixel(
-    texture: &image::Rgb32FImage,
-    x: u32,
-    y: u32,
-    output_width: u32,
-    output_height: u32,
-) -> glam::Vec3 {
-    let sample_x = if texture.width() == output_width {
-        x
-    } else {
-        (((x as f32 + 0.5) * texture.width() as f32 / output_width as f32).floor() as u32)
-            .min(texture.width().saturating_sub(1))
-    };
-
-    let sample_y = if texture.height() == output_height {
-        y
-    } else {
-        (((y as f32 + 0.5) * texture.height() as f32 / output_height as f32).floor() as u32)
-            .min(texture.height().saturating_sub(1))
-    };
-
-    let pixel = texture.get_pixel(sample_x, sample_y).0;
-    glam::vec3(pixel[0], pixel[1], pixel[2])
 }
 
 impl ParseState {
     const DEFAULT_MATERIAL: CompactedMaterial = {
         let material = CompactedMaterialPart {
             material_flags: MaterialType::DIFFUSE as u32,
-            displacement: 0,
-            normal_map: 0,
-            roughness_u: 0,
-            roughness_v: 0,
-            reflectance: 0,
-            eta: 0,
-            k: 0,
+            displacement: -1,
+            normal_map: -1,
+            roughness_u: -1,
+            roughness_v: -1,
+            reflectance: -1,
+            eta: -1,
+            k: -1,
         };
 
         CompactedMaterial {
             material1: material,
             material2: material,
-            mix_factor: 0,
+            mix_factor: -1,
         }
     };
 
@@ -2516,12 +2662,13 @@ impl ParseState {
         match self.textures.get(&key) {
             Some(texture) => Ok(*texture as i32),
             None => {
-                let mut image = image::Rgb32FImage::new(1, 1);
-                image.put_pixel(0, 0, image::Rgb([value, value, value]));
+                let index = scene.add_texture(crate::scene::Texture {
+                    tex_type: 0,
+                    tex0: value.to_bits(),
+                    tex1: value.to_bits(),
+                    tex2: value.to_bits(),
+                });
 
-                let image = image::DynamicImage::ImageRgb32F(image);
-
-                let index = scene.add_texture(image);
                 self.textures.insert(key, index);
 
                 Ok(index as i32)
@@ -2532,9 +2679,10 @@ impl ParseState {
     fn resolve_constant_spectrum_texture(
         &mut self,
         _value: &Spectrum,
-        _scene: &mut Scene,
+        scene: &mut Scene,
     ) -> Result<i32, String> {
-        todo!()
+        // todo!()
+        self.resolve_constant_rgb_texture(&glam::Vec3::ONE, scene)
     }
 
     fn resolve_constant_rgb_texture(
@@ -2546,98 +2694,18 @@ impl ParseState {
         match self.textures.get(&key) {
             Some(texture) => Ok(*texture as i32),
             None => {
-                let mut image = image::Rgb32FImage::new(1, 1);
-                image.put_pixel(0, 0, image::Rgb(value.to_array()));
+                let index = scene.add_texture(crate::scene::Texture {
+                    tex_type: 0,
+                    tex0: value.x.to_bits(),
+                    tex1: value.y.to_bits(),
+                    tex2: value.z.to_bits(),
+                });
 
-                let image = image::DynamicImage::ImageRgb32F(image);
-
-                let index = scene.add_texture(image);
                 self.textures.insert(key, index);
 
                 Ok(index as i32)
             }
         }
-    }
-
-    fn texture_image<'a>(
-        &self,
-        texture: i32,
-        scene: &'a Scene,
-    ) -> Result<&'a image::DynamicImage, String> {
-        let index = usize::try_from(texture)
-            .ok()
-            .and_then(|texture| texture.checked_sub(1))
-            .ok_or_else(|| format!("texture index {} is invalid", texture))?;
-
-        scene
-            .textures
-            .get(index)
-            .ok_or_else(|| format!("texture index {} is out of bounds", texture))
-    }
-
-    fn resolve_texture_image(
-        &mut self,
-        texture: &TextureRef,
-        scene: &mut Scene,
-    ) -> Result<image::Rgb32FImage, String> {
-        let texture = self.resolve_texture_ref(Some(texture), scene)?;
-        Ok(self.texture_image(texture, scene)?.to_rgb32f())
-    }
-
-    fn create_generated_texture(&mut self, scene: &mut Scene, image: image::Rgb32FImage) -> i32 {
-        scene.add_texture(image::DynamicImage::ImageRgb32F(image)) as i32
-    }
-
-    fn resolve_mix_texture(
-        &mut self,
-        texture1: &TextureRef,
-        texture2: &TextureRef,
-        amount: &TextureRef,
-        scene: &mut Scene,
-    ) -> Result<i32, String> {
-        let texture1 = self.resolve_texture_image(texture1, scene)?;
-        let texture2 = self.resolve_texture_image(texture2, scene)?;
-        let amount = self.resolve_texture_image(amount, scene)?;
-
-        let (width, height) = output_texture_dimensions(&[&texture1, &texture2, &amount]);
-        let mut image = image::Rgb32FImage::new(width, height);
-
-        for y in 0..height {
-            for x in 0..width {
-                let texture1 = sample_texture_pixel(&texture1, x, y, width, height);
-                let texture2 = sample_texture_pixel(&texture2, x, y, width, height);
-                let amount = sample_texture_pixel(&amount, x, y, width, height);
-
-                let pixel = texture1 * (glam::Vec3::ONE - amount) + texture2 * amount;
-                image.put_pixel(x, y, image::Rgb(pixel.to_array()));
-            }
-        }
-
-        Ok(self.create_generated_texture(scene, image))
-    }
-
-    fn resolve_scaled_texture(
-        &mut self,
-        texture: &TextureRef,
-        scale: &TextureRef,
-        scene: &mut Scene,
-    ) -> Result<i32, String> {
-        let texture = self.resolve_texture_image(texture, scene)?;
-        let scale = self.resolve_texture_image(scale, scene)?;
-
-        let (width, height) = output_texture_dimensions(&[&texture, &scale]);
-        let mut image = image::Rgb32FImage::new(width, height);
-
-        for y in 0..height {
-            for x in 0..width {
-                let texture = sample_texture_pixel(&texture, x, y, width, height);
-                let scale = sample_texture_pixel(&scale, x, y, width, height);
-
-                image.put_pixel(x, y, image::Rgb((texture * scale).to_array()));
-            }
-        }
-
-        Ok(self.create_generated_texture(scene, image))
     }
 
     fn resolve_texture_ref(
@@ -2658,25 +2726,87 @@ impl ParseState {
                 }
                 TextureRef::RGB(rgb) => self.resolve_constant_rgb_texture(rgb, scene),
             },
-            None => Ok(0),
+            None => Ok(-1),
         }
     }
 
-    fn resolve_texture(&mut self, texture: &Texture, scene: &mut Scene) -> Result<i32, String> {
+    fn resolve_texture(&mut self, texture: &Texture, image_info: ImageInfo, scene: &mut Scene) -> Result<i32, String> {
         match texture {
             Texture::Constant { value } => self.resolve_texture_ref(Some(value), scene),
-            Texture::ImageMap { filename, .. } => {
-                self.resolve_texture_from_file(Some(filename), scene)
+            Texture::ImageMap {
+                filename,
+                encoding,
+                wrap: _,
+                max_anisotropy: _,
+                filter: _,
+                scale,
+                invert
+            } => {
+                self.resolve_texture_from_file(
+                    Some(filename),
+                    ImageInfo {
+                        gamma: match encoding {
+                            TextureEncoding::Linear => 1.0,
+                            TextureEncoding::Srgb => 2.2,
+                            TextureEncoding::Gamma(value) => *value,
+                        },
+                        scale: *scale,
+                        flags: if *invert { 1 } else { 0 },
+                        ..image_info
+                    },
+                    scene
+                )
             }
             Texture::Mix {
                 texture1,
                 texture2,
                 amount,
-            } => self.resolve_mix_texture(texture1, texture2, amount, scene),
-            Texture::Scale { texture, scale } => self.resolve_scaled_texture(texture, scale, scene),
+            } => {
+                let texture1 = self.resolve_texture_ref(Some(texture1), scene)?;
+                let texture2 = self.resolve_texture_ref(Some(texture2), scene)?;
+                let amount = self.resolve_texture_ref(Some(amount), scene)?;
+
+                if texture1 == -1 || texture2 == -1 || amount == -1 {
+                    log::warn!("invalid mix texture references");
+                    Ok(scene.add_texture(crate::scene::Texture {
+                        tex_type: 0,
+                        tex0: 0.0f32.to_bits(),
+                        tex1: 0.0f32.to_bits(),
+                        tex2: 0.0f32.to_bits(),
+                    }) as i32)
+                } else {
+                    Ok(scene.add_texture(crate::scene::Texture {
+                        tex_type: 2,
+                        tex0: texture1 as u32,
+                        tex1: texture2 as u32,
+                        tex2: amount as u32,
+                    }) as i32)
+                }
+            }
+            Texture::Scale { texture, scale } => {
+                let texture = self.resolve_texture_ref(Some(texture), scene)?;
+                let scale = self.resolve_texture_ref(Some(scale), scene)?;
+
+                if texture == -1 || scale == -1 {
+                    log::warn!("invalid scale texture references");
+                    Ok(scene.add_texture(crate::scene::Texture {
+                        tex_type: 0,
+                        tex0: 0.0f32.to_bits(),
+                        tex1: 0.0f32.to_bits(),
+                        tex2: 0.0f32.to_bits(),
+                    }) as i32)
+                } else {
+                    Ok(scene.add_texture(crate::scene::Texture {
+                        tex_type: 3,
+                        tex0: texture as u32,
+                        tex1: scale as u32,
+                        tex2: 0
+                    }) as i32)
+                }
+            }
             _ => {
                 log::warn!("unsupported texture type: {}", texture);
-                Ok(0)
+                Ok(-1)
             }
         }
     }
@@ -2684,6 +2814,7 @@ impl ParseState {
     fn resolve_texture_from_file(
         &mut self,
         file: Option<&String>,
+        info: ImageInfo,
         scene: &mut Scene,
     ) -> Result<i32, String> {
         match file {
@@ -2696,14 +2827,21 @@ impl ParseState {
                         let image = load_texture_image(&path)
                             .map_err(|error| format!("error reading `{}`: {}", file, error))?;
 
-                        let index = scene.add_texture(image);
+                        let image = scene.add_image(image, info);
+                        let index = scene.add_texture(crate::scene::Texture {
+                            tex_type: 1,
+                            tex0: image as u32,
+                            tex1: 0,
+                            tex2: 0,
+                        });
+
                         self.textures.insert(key, index);
 
                         Ok(index as i32)
                     }
                 }
             }
-            None => Ok(0),
+            None => Ok(-1),
         }
     }
 
@@ -2721,18 +2859,117 @@ impl ParseState {
                     material_flags: MaterialType::DIFFUSE as u32,
                     displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
                     normal_map: self
-                        .resolve_texture_from_file(normal.normal_map.as_ref(), scene)?,
-                    roughness_u: 0,
-                    roughness_v: 0,
+                        .resolve_texture_from_file(normal.normal_map.as_ref(), ImageInfo::linear(), scene)?,
+                    roughness_u: -1,
+                    roughness_v: -1,
                     reflectance: self.resolve_texture_ref(Some(reflectance), scene)?,
-                    eta: 0,
-                    k: 0,
+                    eta: self.resolve_texture_ref(Some(&TextureRef::Float(1.0)), scene)?,
+                    k: -1,
                 };
 
                 Ok(CompactedMaterial {
                     material1: material,
                     material2: material,
-                    mix_factor: 0,
+                    mix_factor: -1,
+                })
+            }
+            Material::CoatedDiffuse {
+                normal,
+                reflectance,
+                roughness,
+                ..
+            } => {
+                let material = CompactedMaterialPart {
+                    material_flags: MaterialType::DIFFUSE as u32,
+                    displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
+                    normal_map: self
+                        .resolve_texture_from_file(normal.normal_map.as_ref(), ImageInfo::linear(), scene)?,
+                    roughness_u: self.resolve_texture_ref(Some(&roughness.u), scene)?,
+                    roughness_v: self.resolve_texture_ref(Some(&roughness.v), scene)?,
+                    reflectance: self.resolve_texture_ref(Some(reflectance), scene)?,
+                    eta: self.resolve_texture_ref(Some(&TextureRef::Float(1.5)), scene)?,
+                    k: -1,
+                };
+
+                Ok(CompactedMaterial {
+                    material1: material,
+                    material2: material,
+                    mix_factor: -1,
+                })
+            }
+            // Material::Dielectric {
+            //     normal,
+            //     roughness,
+            //     eta,
+            // } => {
+            //     let material = CompactedMaterialPart {
+            //         material_flags: MaterialType::DIELECTRIC as u32,
+            //         displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
+            //         normal_map: self
+            //             .resolve_texture_from_file(normal.normal_map.as_ref(), ImageInfo::linear(), scene)?,
+            //         roughness_u: self.resolve_texture_ref(Some(&roughness.u), scene)?,
+            //         roughness_v: self.resolve_texture_ref(Some(&roughness.v), scene)?,
+            //         reflectance: -1,
+            //         eta: self.resolve_texture_ref(Some(eta), scene)?,
+            //         k: -1,
+            //     };
+            //
+            //     Ok(CompactedMaterial {
+            //         material1: material,
+            //         material2: material,
+            //         mix_factor: -1,
+            //     })
+            // }
+            Material::Conductor {
+                normal,
+                roughness,
+                reflectance,
+                eta,
+                k,
+            } => {
+                let material = CompactedMaterialPart {
+                    material_flags: MaterialType::CONDUCTOR as u32,
+                    displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
+                    normal_map: self
+                        .resolve_texture_from_file(normal.normal_map.as_ref(), ImageInfo::linear(), scene)?,
+                    roughness_u: self.resolve_texture_ref(Some(&roughness.u), scene)?,
+                    roughness_v: self.resolve_texture_ref(Some(&roughness.v), scene)?,
+                    reflectance: self.resolve_texture_ref(reflectance.as_ref(), scene)?,
+                    eta: self.resolve_texture_ref(Some(eta), scene)?,
+                    k: self.resolve_texture_ref(Some(k), scene)?,
+                };
+
+                Ok(CompactedMaterial {
+                    material1: material,
+                    material2: material,
+                    mix_factor: -1,
+                })
+            },
+            Material::CoatedConductor {
+                normal,
+                interface_roughness: _,
+                conductor_roughness,
+                reflectance,
+                eta,
+                k,
+                ..
+            } => {
+                let material = CompactedMaterialPart {
+                    material_flags: MaterialType::CONDUCTOR as u32,
+                    displacement: self.resolve_texture_ref(normal.displacement.as_ref(), scene)?,
+                    normal_map: self
+                        .resolve_texture_from_file(normal.normal_map.as_ref(), ImageInfo::linear(), scene)?,
+                    roughness_u: self.resolve_texture_ref(Some(&conductor_roughness.u), scene)?,
+                    roughness_v: self.resolve_texture_ref(Some(&conductor_roughness.v), scene)?,
+                    reflectance: self.resolve_texture_ref(reflectance.as_ref(), scene)?,
+                    eta: self.resolve_texture_ref(Some(eta), scene)?,
+                    k: self.resolve_texture_ref(Some(k), scene)?,
+                };
+
+                Ok(CompactedMaterial {
+                    material1: material,
+                    material2: material,
+                    mix_factor: -1,
                 })
             }
             Material::Mix { materials, amount } => {
@@ -2940,12 +3177,20 @@ impl ParseState {
                 texture,
                 mapping,
             } => {
+                let mut info = ImageInfo::linear();
+
                 match mapping {
-                    TextureMapping::Uv { .. } => {}
+                    TextureMapping::Uv {
+                        scale,
+                        delta,
+                    } => {
+                        info.uv_scale = scale;
+                        info.uv_delta = delta;
+                    }
                     _ => log::warn!("unsupported mapping type {:?}", mapping),
                 }
 
-                let texture = self.resolve_texture(&texture, scene)?;
+                let texture = self.resolve_texture(&texture, info, scene)?;
                 self.textures.insert(name, texture as usize);
             }
 
@@ -2966,6 +3211,29 @@ impl ParseState {
             Directive::Material(material) => {
                 let material = self.resolve_material(&material, scene)?;
                 self.graphics_state.last_mut().unwrap().current_material = material;
+            }
+
+            Directive::LightSource {
+                light,
+                illuminance: _,
+                scale: _,
+            } => {
+                match light {
+                    Light::Infinite {
+                        filename,
+                        portal: _,
+                        illuminant: _,
+                    } => {
+                        if filename.is_some() {
+                            let image = self.resolve_texture_from_file(filename.as_ref(), ImageInfo::linear(), scene)?;
+                            scene.environment.light_map = image;
+                        }
+                    }
+
+                    _ => {
+                        log::warn!("unsupported light source type: {:?}", light);
+                    }
+                }
             }
 
             _ => {

@@ -3,9 +3,9 @@ pub mod pbrt;
 pub mod scene;
 
 use crate::scene::MeshVertex;
+use image::EncodableLayout;
 use std::sync::Arc;
 use std::time::Instant;
-use image::EncodableLayout;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -18,12 +18,10 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 struct InstanceData {
     first_index: u32,
     first_vertex: u32,
-    // material: scene::CompactedMaterial,
+    material: scene::CompactedMaterial,
 }
 
 struct SceneData {
-    #[allow(unused)]
-    scene: scene::Scene,
     scene_bind_group: wgpu::BindGroup,
 }
 
@@ -83,6 +81,28 @@ fn create_view_group(
     render_buffer: &wgpu::TextureView,
     accumulation_buffer: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let spectral_data = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: include_bytes!("spectral_data.dat"),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let solar_irradiance = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: include_bytes!("solar_irradiance.dat"),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
@@ -98,6 +118,18 @@ fn create_view_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: camera_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: spectral_data.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: solar_irradiance.as_entire_binding(),
             },
         ],
     })
@@ -148,7 +180,7 @@ impl State {
             .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
+        let _surface_format = surface_caps
             .formats
             .iter()
             .find(|f| f.is_srgb())
@@ -196,6 +228,32 @@ impl State {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -255,7 +313,37 @@ impl State {
                             multisampled: false,
                         },
                         count: std::num::NonZeroU32::new(4096),
-                    }
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -507,54 +595,112 @@ impl State {
 
         let mut textures: Vec<wgpu::TextureView> = Vec::with_capacity(scene.textures.len());
 
-        for texture_data in &scene.textures {
-            let texture = self.device.create_texture(
-                &wgpu::TextureDescriptor {
-                    label: None,
-                    size: wgpu::Extent3d {
-                        width: texture_data.width(),
-                        height: texture_data.height(),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba32Float,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[]
-                }
-            );
+        let mut unorm_images = 0;
+        let mut float_images = 0;
 
-            let pixel_data = texture_data.to_rgba32f();
+        for i in 0..scene.images.len() {
+            let image = &scene.images[i];
 
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
+            let texture_extent = wgpu::Extent3d {
+                width: image.width(),
+                height: image.height(),
+                depth_or_array_layers: 1,
+            };
+
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: texture_extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: match image {
+                    image::DynamicImage::ImageRgba8(_) | image::DynamicImage::ImageRgb8(_) => {
+                        wgpu::TextureFormat::Rgba8Unorm
+                    }
+                    _ => wgpu::TextureFormat::Rgba32Float,
                 },
-                &pixel_data.as_bytes(),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(16 * texture_data.width()),
-                    rows_per_image: Some(texture_data.height()),
-                },
-                wgpu::Extent3d {
-                    width: texture_data.width(),
-                    height: texture_data.height(),
-                    depth_or_array_layers: 1,
-                }
-            );
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            let bytes_per_pixel = match image {
+                image::DynamicImage::ImageRgba8(_) | image::DynamicImage::ImageRgb8(_) => 4,
+                _ => 16,
+            };
+
+            if bytes_per_pixel == 4 {
+                unorm_images += 1;
+            } else {
+                float_images += 1;
+            }
+
+            let copy_info = wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            };
+            let buffer_layout = wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_pixel * image.width()),
+                rows_per_image: Some(image.height()),
+            };
+
+            match image {
+                image::DynamicImage::ImageRgba8(image) => self.queue.write_texture(
+                    copy_info,
+                    image.as_bytes(),
+                    buffer_layout,
+                    texture_extent,
+                ),
+                image::DynamicImage::ImageRgb8(_) => self.queue.write_texture(
+                    copy_info,
+                    image.to_rgba8().as_bytes(),
+                    buffer_layout,
+                    texture_extent,
+                ),
+                image::DynamicImage::ImageRgba32F(image) => self.queue.write_texture(
+                    copy_info,
+                    image.as_bytes(),
+                    buffer_layout,
+                    texture_extent,
+                ),
+                _ => self.queue.write_texture(
+                    copy_info,
+                    image.to_rgba32f().as_bytes(),
+                    buffer_layout,
+                    texture_extent,
+                ),
+            }
 
             self.queue.submit([]);
-            self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
 
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             textures.push(view);
         }
 
-        log::info!("loaded {} textures", textures.len());
+        let image_infos = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(scene.image_infos.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let texture_infos = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(scene.textures.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        log::info!(
+            "loaded {} images ({} unorm, {} float), {} textures",
+            textures.len(),
+            unorm_images,
+            float_images,
+            scene.textures.len(),
+        );
 
         log::info!("creating acceleration structures...");
 
@@ -586,6 +732,12 @@ impl State {
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::BLAS_INPUT,
             mapped_at_creation: false,
+        });
+
+        let environment_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::bytes_of(&scene.environment),
+            usage: wgpu::BufferUsages::STORAGE,
         });
 
         total_indices = 0;
@@ -673,6 +825,7 @@ impl State {
                 let instance_data = InstanceData {
                     first_vertex: build_input.vertex_offset as u32,
                     first_index: build_input.index_offset as u32,
+                    material: instance.material,
                 };
 
                 self.queue.write_buffer(
@@ -756,15 +909,26 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::TextureViewArray(&textures.iter().collect::<Vec<_>>()),
-                }
+                    resource: wgpu::BindingResource::TextureViewArray(
+                        &textures.iter().collect::<Vec<_>>(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: image_infos.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: texture_infos.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: environment_buffer.as_entire_binding(),
+                },
             ],
         });
 
-        self.scene_data = Some(SceneData {
-            scene,
-            scene_bind_group,
-        });
+        self.scene_data = Some(SceneData { scene_bind_group });
     }
 }
 
@@ -786,7 +950,7 @@ impl ApplicationHandler<State> for Application {
         self.state = Some(pollster::block_on(State::new(window)).unwrap());
 
         let mut tokenizer = pbrt::Tokenizer::create_from_file(std::path::Path::new(
-            "/Users/jnngl/Desktop/pbrt-v4-scenes/watercolor/camera-1.pbrt",
+            "/Users/jnngl/Desktop/pbrt-v4-scenes/bistro/bistro_cafe.pbrt",
         ))
         .unwrap();
 
